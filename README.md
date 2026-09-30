@@ -7,7 +7,17 @@ Not an SDK. Not a workflow engine. Good enough is good enough.
 
 ## Status
 
-Scaffold only. Package folder exists; the client is not implemented yet.
+The CLI authenticates, fetches the live schema, and executes GraphQL.
+
+```bash
+linear-cli --help
+linear-cli schema
+linear-cli graphql DOCUMENT
+linear-cli graphql --variables JSON DOCUMENT
+```
+
+`DOCUMENT` is a GraphQL document. Use `-` to read that document from stdin.
+When you omit `--variables`, the CLI sends `{}`.
 
 ## Setup
 
@@ -23,10 +33,18 @@ uv run black --check .
 uv run pytest
 ```
 
-## Auth (planned)
+## Auth
 
-Set `LINEAR_API_KEY` to a Linear personal API key, or pass an OAuth access
-token as a Bearer token. See [Linear's GraphQL docs](https://linear.app/developers/graphql).
+Set exactly one of these variables.
+
+- `LINEAR_API_KEY` sends the personal API key as `Authorization: <key>`.
+- `LINEAR_OAUTH_TOKEN` sends the OAuth access token as `Authorization: Bearer <token>`.
+
+A blank value, a value that contains whitespace, or a value that already
+starts with `Bearer ` in any capitalization is rejected. Leaving both unset,
+or setting both, is an error. The CLI does not send a request in those cases.
+
+See the [Linear GraphQL API](https://linear.app/developers/graphql).
 
 ## Agent instructions
 

@@ -29,7 +29,8 @@ Skip the ceremony on typo-sized work.
 - Self-describing: an agent should be able to discover what it can do from the
   tool itself (`--help`, schema/describe), not from a second handbook.
 - Auth is a token. Personal API keys go in `LINEAR_API_KEY` and are sent as
-  `Authorization: <key>`. OAuth access tokens use `Authorization: Bearer <token>`.
+  `Authorization: <key>`. OAuth access tokens go in `LINEAR_OAUTH_TOKEN` and
+  are sent as `Authorization: Bearer <token>`. Set exactly one.
 - One HTTP client. One schema fetch. Commands derived from the spec, not a
   hand-maintained catalog of Linear.
 
@@ -47,7 +48,7 @@ If a change needs a new layer, it is probably the wrong change.
 AGENTS.md                 # this file — shared policy
 CLAUDE.md                 # Claude Code import of AGENTS.md
 .cursor/rules/            # Cursor pointer at AGENTS.md
-src/linear_cli/           # the package (empty until implemented)
+src/linear_cli/           # CLI, credential check, and GraphQL client
 tests/                    # pytest
 .github/workflows/ci.yml  # ruff, black, pytest
 ```
@@ -66,10 +67,9 @@ uv run pytest
 Format with `uv run black .`. Lint with `uv run ruff check .`. Do not enable
 Ruff's formatter; Black owns style.
 
-## Implementation notes (later turns)
+## Implementation notes
 
-- No implementation lives here yet. Add the smallest CLI that can authenticate,
-  talk to GraphQL, and describe itself.
+- The CLI authenticates, fetches the live schema, and executes one GraphQL document.
 - Prefer introspection (or another published spec artifact) over vendoring a
   stale operation list. A cached schema is fine if it can be refreshed.
 - Convenience verbs for common issue/project actions are OK if they stay thin
