@@ -3,14 +3,17 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import urllib.request
 from collections.abc import Mapping
-from http.client import HTTPMessage
+from http.client import HTTPMessage, IncompleteRead
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Self
 from urllib.error import HTTPError, URLError
 
 import pytest
 
+import linear_cli.cli as cli_mod
 from linear_cli.cli import (
     OAuthAccessToken,
     PersonalApiKey,
@@ -406,18 +409,21 @@ def test_stdlib_post_success(monkeypatch: pytest.MonkeyPatch) -> None:
         def __exit__(self, *_args: object) -> bool:
             return False
 
-    def _urlopen(request: urllib.request.Request, timeout: float = 0) -> _Response:
-        assert request.full_url == "https://api.linear.app/graphql"
-        assert request.get_method() == "POST"
-        assert request.get_header("Authorization") == "lin_api_test"
-        assert request.get_header("Content-type") == "application/json"
-        assert request.get_header("Accept") == "application/json"
-        assert timeout == 30.0
-        assert isinstance(request.data, bytes)
-        assert b"__schema" in request.data
-        return _Response()
+    class _Opener:
+        def open(
+            self, request: urllib.request.Request, timeout: float = 0
+        ) -> _Response:
+            assert request.full_url == "https://api.linear.app/graphql"
+            assert request.get_method() == "POST"
+            assert request.get_header("Authorization") == "lin_api_test"
+            assert request.get_header("Content-type") == "application/json"
+            assert request.get_header("Accept") == "application/json"
+            assert timeout == 30.0
+            assert isinstance(request.data, bytes)
+            assert b"__schema" in request.data
+            return _Response()
 
-    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(cli_mod, "_OPENER", _Opener())
     code, out, err, calls = _run(
         ["schema"],
         environ={"LINEAR_API_KEY": "lin_api_test"},
@@ -433,17 +439,18 @@ def test_stdlib_post_reads_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
     message = 'Cannot query field "nope" on type "Query".'
     payload = {"errors": [{"message": message}]}
 
-    def _urlopen(request: urllib.request.Request, timeout: float = 0) -> object:
-        assert timeout == 30.0
-        raise HTTPError(
-            request.full_url,
-            400,
-            "Bad Request",
-            HTTPMessage(),
-            io.BytesIO(json.dumps(payload).encode()),
-        )
+    class _Opener:
+        def open(self, request: urllib.request.Request, timeout: float = 0) -> object:
+            assert timeout == 30.0
+            raise HTTPError(
+                request.full_url,
+                400,
+                "Bad Request",
+                HTTPMessage(),
+                io.BytesIO(json.dumps(payload).encode()),
+            )
 
-    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(cli_mod, "_OPENER", _Opener())
     code, out, err, _calls = _run(
         ["graphql", VIEWER_QUERY],
         environ={"LINEAR_API_KEY": "lin_api_test"},
@@ -457,12 +464,13 @@ def test_stdlib_post_reads_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_stdlib_post_sanitizes_urlerror(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _urlopen(request: urllib.request.Request, timeout: float = 0) -> object:
-        assert request.get_header("Authorization") == "lin_api_test"
-        assert timeout == 30.0
-        raise URLError("connection refused")
+    class _Opener:
+        def open(self, request: urllib.request.Request, timeout: float = 0) -> object:
+            assert request.get_header("Authorization") == "lin_api_test"
+            assert timeout == 30.0
+            raise URLError("connection refused")
 
-    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(cli_mod, "_OPENER", _Opener())
     code, out, err, _calls = _run(
         ["schema"],
         environ={"LINEAR_API_KEY": "lin_api_test"},
@@ -472,6 +480,119 @@ def test_stdlib_post_sanitizes_urlerror(monkeypatch: pytest.MonkeyPatch) -> None
     assert out == ""
     assert err == "linear-cli: connection refused\n"
     assert "lin_api_test" not in err
+
+
+def test_http_503_with_empty_errors_is_failure() -> None:
+    code, out, err, calls = _run(
+        ["schema"],
+        environ={"LINEAR_API_KEY": "lin_api_test"},
+        reply=_HttpReply(503, "Service Unavailable", b'{"errors":[],"data":{}}'),
+    )
+    assert code == 1
+    assert out == ""
+    assert err.startswith("linear-cli: HTTP 503 ")
+    assert len(calls) == 1
+
+
+def test_overflow_variables_rejected() -> None:
+    code, out, err, calls = _run(
+        ["graphql", "--variables", '{"n":1e400}', VIEWER_QUERY],
+        environ={"LINEAR_API_KEY": "lin_api_test"},
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert "JSON object" in err
+
+
+def test_nested_overflow_variables_rejected() -> None:
+    code, out, err, calls = _run(
+        ["graphql", "--variables", '{"n":[1e400]}', VIEWER_QUERY],
+        environ={"LINEAR_API_KEY": "lin_api_test"},
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert "JSON object" in err
+
+
+def test_incomplete_read_is_remote_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Response:
+        status = 200
+        reason = "OK"
+
+        def read(self) -> bytes:
+            raise IncompleteRead(b"partial", 100)
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    class _Opener:
+        def open(
+            self, request: urllib.request.Request, timeout: float = 0
+        ) -> _Response:
+            return _Response()
+
+    monkeypatch.setattr(cli_mod, "_OPENER", _Opener())
+    code, out, err, calls = _run(
+        ["schema"],
+        environ={"LINEAR_API_KEY": "lin_api_test"},
+        post=_stdlib_post,
+    )
+    assert calls == []
+    assert code == 1
+    assert out == ""
+    assert err.startswith("linear-cli: ")
+    assert "Traceback" not in err
+    assert "lin_api_test" not in err
+
+
+def test_stdlib_post_does_not_follow_redirect() -> None:
+    seen: list[tuple[str, str | None]] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            seen.append((self.path, self.headers.get("Authorization")))
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            if self.path == "/graphql":
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://127.0.0.1:{self.server.server_address[1]}/stolen",
+                )
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"data":{}}')
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        reply = _stdlib_post(
+            url=f"http://127.0.0.1:{port}/graphql",
+            headers={
+                "Authorization": "lin_api_test",
+                "Content-Type": "application/json",
+            },
+            body=b"{}",
+            timeout_seconds=5.0,
+        )
+        assert reply.status == 302
+        assert seen == [("/graphql", "lin_api_test")]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
 
 
 def test_module_help() -> None:

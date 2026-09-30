@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from http.client import IncompleteRead
 from typing import Final, Protocol, TextIO, TypeAlias
 from urllib.error import HTTPError, URLError
 
@@ -230,11 +232,15 @@ class GraphQLClient:
 
     def execute(self, operation: GraphQLOperation) -> GraphQLResponse:
         secret = self.credential.value
-        body = json.dumps(
-            {"query": operation.document, "variables": operation.variables},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        try:
+            body = json.dumps(
+                {"query": operation.document, "variables": operation.variables},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except ValueError:
+            raise LocalInputError("--variables must be a JSON object") from None
         try:
             reply = self.post(
                 url=LINEAR_GRAPHQL_URL,
@@ -342,6 +348,7 @@ def _variables(raw: str) -> JsonObject:
         raise LocalInputError("--variables must be a JSON object") from None
     if not isinstance(value, dict):
         raise LocalInputError("--variables must be a JSON object")
+    _reject_nonfinite(value)
     return value
 
 
@@ -355,10 +362,15 @@ def _authorization(credential: Credential) -> str:
 
 
 def _envelope(reply: _HttpReply) -> JsonObject | None:
+    if 300 <= reply.status < 400:
+        return None
     payload = _json_object(reply.body)
     if payload is None:
         return None
-    if reply.status == 200 or "data" in payload or "errors" in payload:
+    if reply.status == 200:
+        return payload
+    errors = payload.get("errors")
+    if isinstance(errors, list) and len(errors) > 0:
         return payload
     return None
 
@@ -379,6 +391,17 @@ def _json_object(body: bytes) -> JsonObject | None:
 
 def _reject_constant(constant: str) -> None:
     raise json.JSONDecodeError("invalid JSON number", constant, 0)
+
+
+def _reject_nonfinite(value: object) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise LocalInputError("--variables must be a JSON object")
+    if isinstance(value, dict):
+        for item in value.values():
+            _reject_nonfinite(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_nonfinite(item)
 
 
 def _http_diagnostic(reply: _HttpReply, secret: str) -> str:
@@ -421,6 +444,16 @@ def _bind_parser(stdout: TextIO, stderr: TextIO) -> type[argparse.ArgumentParser
     return BoundParser
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def http_error_302(self, req, fp, code, msg, headers):
+        raise HTTPError(req.full_url, code, msg, headers, fp)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _stdlib_post(
     *,
     url: str,
@@ -435,17 +468,19 @@ def _stdlib_post(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        with _OPENER.open(request, timeout=timeout_seconds) as response:
             return _HttpReply(
                 status=response.status,
                 reason=str(response.reason or ""),
                 body=response.read(),
             )
+    except IncompleteRead as err:
+        raise RemoteFailure(_collapse(str(err), "")) from None
     except HTTPError as err:
         # HTTPError subclasses URLError, so it must be handled before URLError.
         try:
             payload = err.read()
-        except OSError as read_err:
+        except (OSError, IncompleteRead) as read_err:
             raise RemoteFailure(_collapse(str(read_err), "")) from None
         finally:
             err.close()
