@@ -1,0 +1,6 @@
+---
+description: Shared repo policy lives in AGENTS.md
+alwaysApply: true
+---
+
+Follow `AGENTS.md`. Do not add a second policy here.
