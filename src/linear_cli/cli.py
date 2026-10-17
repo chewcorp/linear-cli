@@ -1171,9 +1171,8 @@ def _body(path: str, stdin: TextIO) -> str:
 def _comments_since(raw: str | None) -> str | None:
     if raw is None:
         return None
-    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
     try:
-        datetime.fromisoformat(text)
+        datetime.fromisoformat(raw)
     except ValueError:
         raise LocalInputError("--comments-since must be an ISO-8601 time") from None
     return raw
