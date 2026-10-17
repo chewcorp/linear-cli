@@ -9,6 +9,7 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from http.client import IncompleteRead
+from importlib.metadata import version as package_version
 from typing import Final, Protocol, TextIO, TypeAlias
 from urllib.error import HTTPError, URLError
 
@@ -143,6 +144,8 @@ class FetchSchema:
 @dataclass(frozen=True, slots=True)
 class ExecuteOperation:
     operation: GraphQLOperation
+    compact: bool
+    data_only: bool
 
 
 Invocation: TypeAlias = FetchSchema | ExecuteOperation
@@ -200,6 +203,11 @@ def parse_invocation(
         prog="linear-cli",
         description="Use Linear through its published GraphQL schema.",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=package_version("linear-cli"),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("schema", help="fetch the live GraphQL schema")
     graphql = commands.add_parser("graphql", help="execute one GraphQL document")
@@ -208,6 +216,16 @@ def parse_invocation(
         default="{}",
         metavar="JSON",
         help="JSON object of variables",
+    )
+    graphql.add_argument(
+        "--compact",
+        action="store_true",
+        help="print minified JSON",
+    )
+    graphql.add_argument(
+        "--data",
+        action="store_true",
+        help="print only the data object",
     )
     graphql.add_argument(
         "document",
@@ -221,7 +239,9 @@ def parse_invocation(
         GraphQLOperation(
             document=_document(namespace.document, stdin),
             variables=_variables(namespace.variables),
-        )
+        ),
+        compact=namespace.compact,
+        data_only=namespace.data,
     )
 
 
@@ -287,10 +307,16 @@ def main(
     except LocalInputError as exc:
         _write_line(stderr, str(exc))
         return 2
+    compact = False
+    data_only = False
     match invocation:
         case FetchSchema():
             operation = GraphQLOperation(INTROSPECTION_QUERY, {})
-        case ExecuteOperation(operation=operation):
+        case ExecuteOperation(
+            operation=operation,
+            compact=compact,
+            data_only=data_only,
+        ):
             pass
         case _:
             _write_line(stderr, "unknown command")
@@ -300,7 +326,12 @@ def main(
     except RemoteFailure as exc:
         _write_line(stderr, str(exc))
         return 1
-    stdout.write(json.dumps(response.payload, indent=2, ensure_ascii=False))
+    shown: JsonValue = response.payload.get("data") if data_only else response.payload
+    if compact:
+        rendered = json.dumps(shown, ensure_ascii=False, separators=(",", ":"))
+    else:
+        rendered = json.dumps(shown, indent=2, ensure_ascii=False)
+    stdout.write(rendered)
     stdout.write("\n")
     if not response.has_errors:
         return 0
@@ -430,6 +461,16 @@ def _bind_parser(stdout: TextIO, stderr: TextIO) -> type[argparse.ArgumentParser
 
         def print_usage(self, file: TextIO | None = None) -> None:
             super().print_usage(stderr if file is None else file)
+
+        def _print_message(self, message: str, file: TextIO | None = None) -> None:
+            if not message:
+                return
+            if file is None or file is sys.stdout:
+                stdout.write(message)
+            elif file is sys.stderr:
+                stderr.write(message)
+            else:
+                file.write(message)
 
         def exit(self, status: int | None = 0, message: str | None = None) -> None:
             if message:

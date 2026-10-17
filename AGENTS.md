@@ -18,6 +18,8 @@ Karpathy's four, plus a stop condition:
 
 **Good enough is good enough.** Stop when the goal is met. Do not gold-plate.
 
+Agents working here use the [ponytail](https://github.com/DietrichGebert/ponytail) plugin at level full.
+
 Skip the ceremony on typo-sized work.
 
 ## What this is

@@ -5,6 +5,17 @@ what it can do from the tool and Linear's published GraphQL schema.
 
 Not an SDK. Not a workflow engine. Good enough is good enough.
 
+## Install
+
+```bash
+uv tool install git+https://github.com/chewcorp/linear-cli@v0.1.1
+uv tool upgrade linear-cli
+```
+
+`pipx install` accepts the same git URL.
+
+Set exactly one of `LINEAR_API_KEY` or `LINEAR_OAUTH_TOKEN`. `LINEAR_API_KEY` is the raw personal API key, never `Bearer`. Hermes cron jobs need `LINEAR_API_KEY` in `env_passthrough`.
+
 ## Status
 
 The CLI authenticates, fetches the live schema, and executes GraphQL.
