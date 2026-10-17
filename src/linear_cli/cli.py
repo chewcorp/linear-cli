@@ -5,11 +5,14 @@ import json
 import math
 import os
 import sys
+import tomllib
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from http.client import IncompleteRead
+from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
+from pathlib import Path
 from typing import Final, Protocol, TextIO, TypeAlias
 from urllib.error import HTTPError, URLError
 
@@ -199,14 +202,17 @@ def parse_invocation(
     stdout: TextIO,
     stderr: TextIO,
 ) -> Invocation:
+    if "--version" in argv:
+        stdout.write(f"{_package_version()}\n")
+        raise _ParserExit(0)
     parser = _bind_parser(stdout, stderr)(
         prog="linear-cli",
         description="Use Linear through its published GraphQL schema.",
     )
     parser.add_argument(
         "--version",
-        action="version",
-        version=package_version("linear-cli"),
+        action="store_true",
+        help="show the package version and exit",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("schema", help="fetch the live GraphQL schema")
@@ -326,13 +332,14 @@ def main(
     except RemoteFailure as exc:
         _write_line(stderr, str(exc))
         return 1
-    shown: JsonValue = response.payload.get("data") if data_only else response.payload
-    if compact:
-        rendered = json.dumps(shown, ensure_ascii=False, separators=(",", ":"))
-    else:
-        rendered = json.dumps(shown, indent=2, ensure_ascii=False)
-    stdout.write(rendered)
-    stdout.write("\n")
+    shown = response.payload.get("data") if data_only else response.payload
+    if not (data_only and response.has_errors and shown is None):
+        if compact:
+            rendered = json.dumps(shown, ensure_ascii=False, separators=(",", ":"))
+        else:
+            rendered = json.dumps(shown, indent=2, ensure_ascii=False)
+        stdout.write(rendered)
+        stdout.write("\n")
     if not response.has_errors:
         return 0
     _write_line(stderr, "GraphQL response contains errors")
@@ -454,6 +461,27 @@ def _write_line(stream: TextIO, message: str) -> None:
     stream.write(f"linear-cli: {message}\n")
 
 
+def _package_version() -> str:
+    try:
+        return package_version("linear-cli")
+    except PackageNotFoundError:
+        return _pyproject_version() or "unknown"
+
+
+def _pyproject_version() -> str | None:
+    path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    try:
+        project = tomllib.loads(path.read_text(encoding="utf-8")).get("project")
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    if not isinstance(project, dict):
+        return None
+    version = project.get("version")
+    if isinstance(version, str) and version:
+        return version
+    return None
+
+
 def _bind_parser(stdout: TextIO, stderr: TextIO) -> type[argparse.ArgumentParser]:
     class BoundParser(argparse.ArgumentParser):
         def print_help(self, file: TextIO | None = None) -> None:
@@ -461,16 +489,6 @@ def _bind_parser(stdout: TextIO, stderr: TextIO) -> type[argparse.ArgumentParser
 
         def print_usage(self, file: TextIO | None = None) -> None:
             super().print_usage(stderr if file is None else file)
-
-        def _print_message(self, message: str, file: TextIO | None = None) -> None:
-            if not message:
-                return
-            if file is None or file is sys.stdout:
-                stdout.write(message)
-            elif file is sys.stderr:
-                stderr.write(message)
-            else:
-                file.write(message)
 
         def exit(self, status: int | None = 0, message: str | None = None) -> None:
             if message:
