@@ -30,6 +30,21 @@ linear-cli graphql --variables JSON DOCUMENT
 `DOCUMENT` is a GraphQL document. Use `-` to read that document from stdin.
 When you omit `--variables`, the CLI sends `{}`.
 
+## Read changes since the last wake
+
+```bash
+linear-cli issues changed --team CCP,CPB,BRD --state-file ~/.linear-last-wake
+```
+
+The first run writes the current time to that file and prints nothing.
+Each later run prints one JSON line per issue updated after the stored time, across every named team.
+It then writes the time the run started.
+A failed run leaves the file unchanged, so the next run repeats the window.
+Pass `--since 2026-10-17T09:00:00Z` instead of `--state-file` when you want one window and no file.
+Add `--with-comments` to include comments created in that same window.
+
+`graphql --paginate` follows one connection that declares `$after` and selects `pageInfo { hasNextPage endCursor }`, then prints those pages as one result.
+
 ## Setup
 
 ```bash

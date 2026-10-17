@@ -4,11 +4,14 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
+import tempfile
 import tomllib
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from http.client import IncompleteRead
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -24,6 +27,29 @@ LINEAR_GRAPHQL_URL: Final[str] = "https://api.linear.app/graphql"
 HTTP_TIMEOUT_SECONDS: Final[float] = 30.0
 _API_KEY_ENV: Final[str] = "LINEAR_API_KEY"
 _OAUTH_ENV: Final[str] = "LINEAR_OAUTH_TOKEN"
+_ISSUE_PAGE_SIZE: Final[int] = 50
+# shortcut: 50 comments per issue, raise this if a wake needs more
+_COMMENT_PAGE_SIZE: Final[int] = 50
+_COMMENT_BODY_LIMIT: Final[int] = 280
+# shortcut: 500 pages, raise this if a real walk is longer
+_MAX_PAGES: Final[int] = 500
+_AFTER_DEFINITION: Final[re.Pattern[str]] = re.compile(r"\$after\s*:")
+_ISSUE_FIELDS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
+    ("identifier", ("identifier",)),
+    ("title", ("title",)),
+    ("state", ("state", "name")),
+    ("assignee", ("assignee", "displayName")),
+    ("priority", ("priority",)),
+    ("estimate", ("estimate",)),
+    ("cycle", ("cycle", "number")),
+    ("updatedAt", ("updatedAt",)),
+    ("url", ("url",)),
+)
+_COMMENT_FIELDS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
+    ("author", ("user", "displayName")),
+    ("createdAt", ("createdAt",)),
+    ("body", ("body",)),
+)
 
 INTROSPECTION_QUERY: Final[str] = r"""
 query LinearCliSchema {
@@ -149,9 +175,43 @@ class ExecuteOperation:
     operation: GraphQLOperation
     compact: bool
     data_only: bool
+    paginate: bool
 
 
-Invocation: TypeAlias = FetchSchema | ExecuteOperation
+@dataclass(frozen=True, slots=True)
+class Since:
+    at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Resume:
+    at: datetime
+    state_file: Path
+
+
+@dataclass(frozen=True, slots=True)
+class Baseline:
+    state_file: Path
+
+
+Window: TypeAlias = Since | Resume | Baseline
+
+
+@dataclass(frozen=True, slots=True)
+class IssuesChanged:
+    teams: tuple[str, ...]
+    window: Window
+    with_comments: bool
+
+
+Invocation: TypeAlias = FetchSchema | ExecuteOperation | IssuesChanged
+
+
+@dataclass(frozen=True, slots=True)
+class _Page:
+    nodes: list[JsonValue]
+    has_next_page: bool
+    end_cursor: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,20 +294,50 @@ def parse_invocation(
         help="print only the data object",
     )
     graphql.add_argument(
+        "--paginate",
+        action="store_true",
+        help="follow one $after connection and merge its nodes",
+    )
+    graphql.add_argument(
         "document",
         metavar="DOCUMENT",
         help="GraphQL document, or - to read stdin",
     )
+    issues = commands.add_parser("issues", help="issue convenience commands")
+    issue_commands = issues.add_subparsers(dest="issues_command", required=True)
+    changed = issue_commands.add_parser(
+        "changed",
+        help="issues updated since a time",
+    )
+    changed.add_argument("--team", required=True, help="comma-separated team keys")
+    window = changed.add_mutually_exclusive_group(required=True)
+    window.add_argument("--since", help="ISO-8601 time with a timezone")
+    window.add_argument(
+        "--state-file",
+        help="watermark file, written only after a successful run",
+    )
+    changed.add_argument(
+        "--with-comments",
+        action="store_true",
+        help="include comments created since the same time",
+    )
     namespace = parser.parse_args(list(argv))
     if namespace.command == "schema":
         return FetchSchema()
+    if namespace.command == "issues":
+        return IssuesChanged(
+            teams=_team_keys(namespace.team),
+            window=_window(namespace.since, namespace.state_file),
+            with_comments=namespace.with_comments,
+        )
+    document = _document(namespace.document, stdin)
+    if namespace.paginate:
+        _require_after(document)
     return ExecuteOperation(
-        GraphQLOperation(
-            document=_document(namespace.document, stdin),
-            variables=_variables(namespace.variables),
-        ),
+        GraphQLOperation(document=document, variables=_variables(namespace.variables)),
         compact=namespace.compact,
         data_only=namespace.data,
+        paginate=namespace.paginate,
     )
 
 
@@ -285,6 +375,43 @@ class GraphQLClient:
             raise RemoteFailure(_http_diagnostic(reply, secret))
         return GraphQLResponse(payload)
 
+    def paginate(self, operation: GraphQLOperation) -> GraphQLResponse:
+        _require_after(operation.document)
+        seen: set[str] = set()
+        current = operation
+        first: GraphQLResponse | None = None
+        path: tuple[str, ...] | None = None
+        nodes: list[JsonValue] = []
+        page: _Page | None = None
+        for _ in range(_MAX_PAGES):
+            sent = current.variables.get("after")
+            if isinstance(sent, str) and sent in seen:
+                raise RemoteFailure("pagination cursor did not advance")
+            if isinstance(sent, str):
+                seen.add(sent)
+            response = self.execute(current)
+            if response.has_errors:
+                return response
+            if first is None:
+                first = response
+                path, page = _one_connection(_data(response))
+            else:
+                assert path is not None
+                page = _read_page(_data(response), path)
+            nodes.extend(page.nodes)
+            if not page.has_next_page:
+                assert first is not None and path is not None
+                return GraphQLResponse(
+                    _with_connection(first.payload, path, nodes, page.end_cursor)
+                )
+            cursor = page.end_cursor
+            if cursor is None or cursor == "" or cursor in seen:
+                raise RemoteFailure("pagination cursor did not advance")
+            variables = dict(current.variables)
+            variables["after"] = cursor
+            current = GraphQLOperation(operation.document, variables)
+        raise RemoteFailure(f"pagination stopped after {_MAX_PAGES} pages")
+
 
 def main(
     argv: Sequence[str] | None = None,
@@ -315,6 +442,7 @@ def main(
         return 2
     compact = False
     data_only = False
+    paginate = False
     match invocation:
         case FetchSchema():
             operation = GraphQLOperation(INTROSPECTION_QUERY, {})
@@ -322,16 +450,29 @@ def main(
             operation=operation,
             compact=compact,
             data_only=data_only,
+            paginate=paginate,
         ):
             pass
-        case _:
-            _write_line(stderr, "unknown command")
-            return 2
+        case IssuesChanged() as command:
+            try:
+                return _issues_changed(
+                    GraphQLClient(credential, post), command, stdout, stderr
+                )
+            except (RemoteFailure, OSError) as exc:
+                _write_line(stderr, str(exc))
+                return 1
+            except LocalInputError as exc:
+                _write_line(stderr, str(exc))
+                return 2
     try:
-        response = GraphQLClient(credential, post).execute(operation)
+        client = GraphQLClient(credential, post)
+        response = client.paginate(operation) if paginate else client.execute(operation)
     except RemoteFailure as exc:
         _write_line(stderr, str(exc))
         return 1
+    except LocalInputError as exc:
+        _write_line(stderr, str(exc))
+        return 2
     shown = response.payload.get("data") if data_only else response.payload
     if not (data_only and response.has_errors and shown is None):
         if compact:
@@ -340,6 +481,288 @@ def main(
             rendered = json.dumps(shown, indent=2, ensure_ascii=False)
         stdout.write(rendered)
         stdout.write("\n")
+    return _report(stderr, response)
+
+
+def _require_after(document: str) -> None:
+    if _AFTER_DEFINITION.search(document) is None:
+        raise LocalInputError("--paginate needs a document that declares $after")
+
+
+def _data(response: GraphQLResponse) -> JsonObject:
+    data = response.payload.get("data")
+    if not isinstance(data, dict):
+        raise RemoteFailure("GraphQL response has no data object")
+    return data
+
+
+def _as_page(value: JsonValue) -> _Page | None:
+    if not isinstance(value, dict):
+        return None
+    nodes = value.get("nodes")
+    page_info = value.get("pageInfo")
+    if not isinstance(nodes, list) or not isinstance(page_info, dict):
+        return None
+    if "hasNextPage" not in page_info or "endCursor" not in page_info:
+        return None
+    has_next = page_info.get("hasNextPage")
+    end_cursor = page_info.get("endCursor")
+    if not isinstance(has_next, bool):
+        return None
+    if end_cursor is not None and not isinstance(end_cursor, str):
+        return None
+    return _Page(nodes, has_next, end_cursor)
+
+
+def _connection_paths(
+    value: JsonValue, path: tuple[str, ...]
+) -> list[tuple[tuple[str, ...], _Page]]:
+    if not isinstance(value, dict):
+        return []
+    found: list[tuple[tuple[str, ...], _Page]] = []
+    page = _as_page(value)
+    if page is not None:
+        found.append((path, page))
+    for key, child in value.items():
+        if isinstance(child, dict):
+            found.extend(_connection_paths(child, path + (key,)))
+    return found
+
+
+def _one_connection(data: JsonObject) -> tuple[tuple[str, ...], _Page]:
+    found = _connection_paths(data, ())
+    if len(found) != 1:
+        raise RemoteFailure(
+            f"pagination needs exactly one connection, found {len(found)}"
+        )
+    return found[0]
+
+
+def _read_page(data: JsonObject, path: tuple[str, ...]) -> _Page:
+    value: JsonValue = data
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            raise RemoteFailure("pagination connection missing on a later page")
+        value = value[key]
+    page = _as_page(value)
+    if page is None:
+        raise RemoteFailure("pagination connection missing on a later page")
+    return page
+
+
+def _with_connection(
+    payload: JsonObject,
+    path: tuple[str, ...],
+    nodes: list[JsonValue],
+    end_cursor: str | None,
+) -> JsonObject:
+    cloned = json.loads(json.dumps(payload))
+    cursor: JsonValue = cloned["data"]
+    for key in path:
+        if not isinstance(cursor, dict) or key not in cursor:
+            raise RemoteFailure("pagination connection missing on a later page")
+        cursor = cursor[key]
+    if not isinstance(cursor, dict):
+        raise RemoteFailure("pagination connection missing on a later page")
+    page_info = cursor.get("pageInfo")
+    if not isinstance(page_info, dict):
+        raise RemoteFailure("pagination connection missing on a later page")
+    cursor["nodes"] = nodes
+    page_info["hasNextPage"] = False
+    page_info["endCursor"] = end_cursor
+    return cloned
+
+
+def _team_keys(raw: str) -> tuple[str, ...]:
+    keys: list[str] = []
+    for part in raw.split(","):
+        key = part.strip()
+        if key and key not in keys:
+            keys.append(key)
+    if not keys:
+        raise LocalInputError("--team needs at least one team key")
+    return tuple(keys)
+
+
+def _instant(text: str, source: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise LocalInputError(
+            f"{source} must be an ISO-8601 time with a timezone"
+        ) from None
+    if parsed.tzinfo is None:
+        raise LocalInputError(f"{source} must be an ISO-8601 time with a timezone")
+    return parsed.astimezone(UTC)
+
+
+def _iso(at: datetime) -> str:
+    return at.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _window(since: str | None, state_file: str | None) -> Window:
+    if since is not None:
+        return Since(_instant(since, "--since"))
+    if state_file is None:
+        raise LocalInputError("pass --since or --state-file")
+    path = Path(state_file).expanduser()
+    if not path.exists():
+        return Baseline(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise LocalInputError(f"cannot read state file: {exc.strerror}") from None
+    stripped = text.strip()
+    if stripped == "":
+        raise LocalInputError("state file is empty")
+    return Resume(_instant(stripped, "state file"), path)
+
+
+def _field_selection(path: tuple[str, ...]) -> str:
+    head, *rest = path
+    if not rest:
+        return head
+    return f"{head} {{ {' '.join(rest)} }}"
+
+
+def _selection(fields: tuple[tuple[str, tuple[str, ...]], ...]) -> str:
+    return " ".join(_field_selection(path) for _, path in fields)
+
+
+def _issues_changed_operation(
+    teams: tuple[str, ...],
+    since: datetime,
+    with_comments: bool,
+    *,
+    until: datetime | None = None,
+) -> GraphQLOperation:
+    comments = ""
+    if with_comments:
+        comments = (
+            " comments(first: "
+            f"{_COMMENT_PAGE_SIZE}, filter: {{createdAt: {{gt: $since}}}}) "
+            f"{{ nodes {{ {_selection(_COMMENT_FIELDS)} }} }}"
+        )
+    updated = "gt: $since"
+    declared = "$after: String, $since: DateTimeOrDuration!"
+    variables: JsonObject = {
+        "after": None,
+        "since": _iso(since),
+        "teams": list(teams),
+    }
+    if until is not None:
+        updated = "gt: $since, lte: $until"
+        declared = (
+            "$after: String, $since: DateTimeOrDuration!, $until: DateTimeOrDuration!"
+        )
+        variables["until"] = _iso(until)
+    document = (
+        f"query IssuesChanged({declared}, $teams: [String!]!) {{ "
+        f"issues(first: {_ISSUE_PAGE_SIZE}, after: $after, orderBy: updatedAt, "
+        f"filter: {{updatedAt: {{{updated}}}, team: {{key: {{in: $teams}}}}}}) {{ "
+        f"nodes {{ {_selection(_ISSUE_FIELDS)}{comments} }} "
+        "pageInfo { hasNextPage endCursor } } }"
+    )
+    return GraphQLOperation(document, variables)
+
+
+def _at(node: JsonValue, path: tuple[str, ...]) -> JsonValue:
+    value = node
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+        if value is None:
+            return None
+    return value
+
+
+def _project(
+    node: JsonValue, fields: tuple[tuple[str, tuple[str, ...]], ...]
+) -> JsonObject:
+    if not isinstance(node, dict):
+        raise RemoteFailure("issue node was not an object")
+    return {name: _at(node, path) for name, path in fields}
+
+
+def _comment_lines(node: JsonValue) -> list[JsonObject]:
+    if not isinstance(node, dict):
+        raise RemoteFailure("issue node was not an object")
+    raw = node.get("comments")
+    if not isinstance(raw, dict):
+        raise RemoteFailure("issue comments were missing")
+    nodes = raw.get("nodes")
+    if not isinstance(nodes, list):
+        raise RemoteFailure("issue comments were missing")
+    lines: list[JsonObject] = []
+    for item in nodes:
+        projected = _project(item, _COMMENT_FIELDS)
+        body = projected.get("body")
+        if isinstance(body, str):
+            projected["body"] = body[:_COMMENT_BODY_LIMIT]
+        lines.append(projected)
+    return lines
+
+
+def _issue_line(node: JsonValue, with_comments: bool) -> str:
+    projected = _project(node, _ISSUE_FIELDS)
+    if with_comments:
+        projected["comments"] = _comment_lines(node)
+    return json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+
+
+def _write_watermark(path: Path, at: datetime) -> None:
+    fd, name = tempfile.mkstemp(prefix=".linear-wake-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(_iso(at) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    except OSError:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+
+
+def _issues_changed(
+    client: GraphQLClient,
+    command: IssuesChanged,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    now = datetime.now(UTC)
+    state_file: Path | None
+    match command.window:
+        case Baseline(state_file):
+            _write_watermark(state_file, now)
+            return 0
+        case Since(at):
+            state_file = None
+        case Resume(at, state_file):
+            pass
+    response = client.paginate(
+        _issues_changed_operation(
+            command.teams,
+            at,
+            command.with_comments,
+            until=now if state_file is not None else None,
+        )
+    )
+    if response.has_errors:
+        return _report(stderr, response)
+    page = _read_page(_data(response), ("issues",))
+    lines = [_issue_line(node, command.with_comments) for node in page.nodes]
+    if lines:
+        stdout.write("\n".join(lines) + "\n")
+    if state_file is not None:
+        _write_watermark(state_file, now)
+    return 0
+
+
+def _report(stderr: TextIO, response: GraphQLResponse) -> int:
     if not response.has_errors:
         return 0
     _write_line(stderr, "GraphQL response contains errors")
