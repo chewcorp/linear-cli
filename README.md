@@ -25,10 +25,29 @@ linear-cli --help
 linear-cli schema
 linear-cli graphql DOCUMENT
 linear-cli graphql --variables JSON DOCUMENT
+linear-cli comment ISSUE --body-file PATH
+linear-cli issue get ISSUE [--comments-since ISO]
+linear-cli issue move ISSUE --state NAME
 ```
 
 `DOCUMENT` is a GraphQL document. Use `-` to read that document from stdin.
 When you omit `--variables`, the CLI sends `{}`.
+
+## Shortcuts
+
+```bash
+linear-cli comment CCP-123 --body-file notes.md
+printf 'Shipped in #12.\n' | linear-cli comment CCP-123 --body-file -
+linear-cli issue get CCP-123
+linear-cli issue get CCP-123 --comments-since 2026-10-16T00:00:00Z
+linear-cli issue move CCP-123 --state "In Review"
+```
+
+`comment` prints the new comment's URL.
+`issue get` prints one JSON object.
+`--comments-since` adds the comments created at or after that time.
+`issue move` matches the state name exactly on the issue's team and prints `Old → New`.
+An unknown issue, an unknown state, or a name that matches two states exits 1 and changes nothing.
 
 ## Read changes since the last wake
 

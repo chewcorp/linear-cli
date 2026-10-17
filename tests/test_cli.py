@@ -89,7 +89,7 @@ def test_help() -> None:
     assert calls == []
     assert (
         out.splitlines()[0]
-        == "usage: linear-cli [-h] [--version] {schema,graphql,issues} ..."
+        == "usage: linear-cli [-h] [--version] {schema,graphql,issues,comment,issue} ..."
     )
     assert "schema" in out
     assert "graphql" in out
@@ -750,6 +750,8 @@ def test_module_help() -> None:
     assert "schema" in proc.stdout
     assert "graphql" in proc.stdout
     assert "issues" in proc.stdout
+    assert "comment" in proc.stdout
+    assert "{schema,graphql,issues,comment,issue}" in proc.stdout
 
 
 _KEY = {"LINEAR_API_KEY": "lin_api_test"}
@@ -1157,3 +1159,578 @@ def test_issues_changed_includes_comments_since_the_watermark() -> None:
     assert "comments(" in query
     assert "createdAt: {gt: $since}" in query
     assert sent[0]["variables"]["since"] == "2026-10-17T09:00:00.000Z"
+
+
+def _posted(sent: list[dict[str, object]]) -> list[tuple[str, object]]:
+    return [
+        (str(body["query"]).split()[1].split("(")[0], body["variables"])
+        for body in sent
+    ]
+
+
+def _move_lookup(states: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "data": {
+            "issue": {
+                "id": "issue-uuid",
+                "state": {"name": "Todo"},
+                "team": {"states": {"nodes": states}},
+            }
+        }
+    }
+
+
+def _shown_issue(**overrides: object) -> dict[str, object]:
+    issue: dict[str, object] = {
+        "identifier": "CCP-123",
+        "title": "Write the shortcuts",
+        "description": "markdown or null",
+        "state": {"name": "In Review"},
+        "assignee": {"name": "ada", "displayName": ""},
+        "priority": 2,
+        "estimate": 3,
+        "cycle": {"name": "", "number": 12},
+        "labels": {"nodes": [{"name": "cli"}]},
+        "parent": {"identifier": "CCP-100"},
+        "url": "https://linear.app/chewcorp/issue/CCP-123",
+        "updatedAt": "2026-10-16T12:00:00.000Z",
+    }
+    issue.update(overrides)
+    return {"data": {"issue": issue}}
+
+
+_COMMENT_URL = "https://linear.app/chewcorp/comment/1"
+
+
+def _comment_created(url: str | None = _COMMENT_URL, *, success: bool = True) -> dict:
+    comment = None if url is None else {"url": url}
+    return {"data": {"commentCreate": {"success": success, "comment": comment}}}
+
+
+def test_comment_posts_file_body_to_the_resolved_issue(tmp_path: Path) -> None:
+    body = "  Shipped in #12.\n"
+    path = tmp_path / "notes.md"
+    path.write_text(body)
+    post, sent = _serve(
+        [
+            {"data": {"issue": {"id": "issue-uuid"}}},
+            _comment_created(),
+        ]
+    )
+    code, out, err, calls = _run(
+        ["comment", "CCP-123", "--body-file", str(path)],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, out, err) == (0, f"{_COMMENT_URL}\n", "")
+    assert calls == []
+    assert _posted(sent) == [
+        ("LinearCliIssueId", {"id": "CCP-123"}),
+        ("LinearCliCommentCreate", {"issueId": "issue-uuid", "body": body}),
+    ]
+
+
+def test_comment_reads_body_from_stdin() -> None:
+    body = "From stdin.\n"
+    post, sent = _serve(
+        [
+            {"data": {"issue": {"id": "issue-uuid"}}},
+            _comment_created(),
+        ]
+    )
+    code, out, err, calls = _run(
+        ["comment", "CCP-123", "--body-file", "-"],
+        environ=_KEY,
+        stdin=body,
+        post=post,
+    )
+    assert (code, out, err) == (0, f"{_COMMENT_URL}\n", "")
+    assert calls == []
+    assert _posted(sent) == [
+        ("LinearCliIssueId", {"id": "CCP-123"}),
+        ("LinearCliCommentCreate", {"issueId": "issue-uuid", "body": body}),
+    ]
+
+
+def test_comment_unknown_issue_posts_nothing(tmp_path: Path) -> None:
+    path = tmp_path / "notes.md"
+    path.write_text("hello\n")
+    post, sent = _serve([{"data": {"issue": None}}])
+    code, out, err, calls = _run(
+        ["comment", "CCP-999", "--body-file", str(path)],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, out, err) == (1, "", "linear-cli: unknown issue CCP-999\n")
+    assert calls == []
+    assert _posted(sent) == [("LinearCliIssueId", {"id": "CCP-999"})]
+
+
+def test_comment_lookup_errors_stop_before_the_write(tmp_path: Path) -> None:
+    path = tmp_path / "notes.md"
+    path.write_text("hello\n")
+    post, sent = _serve([{"errors": [{"message": "nope"}]}])
+    code, out, err, calls = _run(
+        ["comment", "CCP-123", "--body-file", str(path)],
+        environ=_KEY,
+        post=post,
+    )
+    assert code == 1
+    assert out == ""
+    assert err == ("linear-cli: GraphQL response contains errors\nlinear-cli: nope\n")
+    assert calls == []
+    assert _posted(sent) == [("LinearCliIssueId", {"id": "CCP-123"})]
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {"data": {"commentCreate": {"success": False}}},
+            "commentCreate returned success: false",
+        ),
+        (
+            {"data": {"commentCreate": {"success": True, "comment": None}}},
+            "commentCreate returned no comment URL",
+        ),
+    ],
+)
+def test_comment_write_failures(
+    tmp_path: Path, payload: dict[str, object], message: str
+) -> None:
+    path = tmp_path / "notes.md"
+    path.write_text("hello\n")
+    post, sent = _serve([{"data": {"issue": {"id": "issue-uuid"}}}, payload])
+    code, out, err, calls = _run(
+        ["comment", "CCP-123", "--body-file", str(path)],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, out, err) == (1, "", f"linear-cli: {message}\n")
+    assert calls == []
+    assert [name for name, _variables in _posted(sent)] == [
+        "LinearCliIssueId",
+        "LinearCliCommentCreate",
+    ]
+
+
+def test_comment_missing_file_is_local(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.md"
+    code, out, err, calls = _run(
+        ["comment", "CCP-123", "--body-file", str(missing)],
+        environ=_KEY,
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert err == f"linear-cli: cannot read {missing}: No such file or directory\n"
+
+
+def test_comment_unreadable_file_is_local(tmp_path: Path) -> None:
+    code, out, err, calls = _run(
+        ["comment", "CCP-123", "--body-file", str(tmp_path)],
+        environ=_KEY,
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert err == f"linear-cli: cannot read {tmp_path}: Is a directory\n"
+
+
+def test_comment_non_utf8_body_is_local(tmp_path: Path) -> None:
+    path = tmp_path / "notes.md"
+    path.write_bytes(b"\xff")
+    code, out, err, calls = _run(
+        ["comment", "CCP-123", "--body-file", str(path)],
+        environ=_KEY,
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert err == f"linear-cli: {path} is not UTF-8\n"
+
+
+@pytest.mark.parametrize(
+    ("kind", "body"),
+    [("file", ""), ("file", " \n\t"), ("stdin", ""), ("stdin", " \n\t")],
+)
+def test_comment_blank_body_is_local(tmp_path: Path, kind: str, body: str) -> None:
+    if kind == "file":
+        path = tmp_path / "notes.md"
+        path.write_text(body)
+        argv_path = str(path)
+        stdin = ""
+    else:
+        argv_path = "-"
+        stdin = body
+    code, out, err, calls = _run(
+        ["comment", "CCP-123", "--body-file", argv_path],
+        environ=_KEY,
+        stdin=stdin,
+    )
+    assert (code, out, calls) == (2, "", [])
+    assert err == "linear-cli: comment body is empty\n"
+
+
+def test_issue_get_prints_one_flat_object() -> None:
+    post, sent = _serve([_shown_issue()])
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123"],
+        environ=_KEY,
+        post=post,
+    )
+    expected = {
+        "identifier": "CCP-123",
+        "title": "Write the shortcuts",
+        "description": "markdown or null",
+        "state": "In Review",
+        "assignee": "ada",
+        "priority": 2,
+        "estimate": 3,
+        "cycle": "12",
+        "labels": ["cli"],
+        "parent": "CCP-100",
+        "url": "https://linear.app/chewcorp/issue/CCP-123",
+        "updatedAt": "2026-10-16T12:00:00.000Z",
+    }
+    assert (code, err, calls) == (0, "", [])
+    assert out == json.dumps(expected, indent=2, ensure_ascii=False) + "\n"
+    assert "comments" not in json.loads(out)
+    assert _posted(sent) == [
+        (
+            "LinearCliIssueGet",
+            {"id": "CCP-123", "withComments": False, "since": None},
+        )
+    ]
+    query = sent[0]["query"]
+    assert isinstance(query, str)
+    assert "labels(first: 50)" in query
+    assert "comments(first: 50, filter: { createdAt: { gte: $since } })" in query
+
+
+def test_issue_get_nulls_absent_fields() -> None:
+    post, _sent = _serve(
+        [
+            _shown_issue(
+                description=None,
+                state=None,
+                assignee=None,
+                estimate=None,
+                cycle=None,
+                parent=None,
+                labels=None,
+            )
+        ]
+    )
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123"],
+        environ=_KEY,
+        post=post,
+    )
+    expected = {
+        "identifier": "CCP-123",
+        "title": "Write the shortcuts",
+        "description": None,
+        "state": None,
+        "assignee": None,
+        "priority": 2,
+        "estimate": None,
+        "cycle": None,
+        "labels": [],
+        "parent": None,
+        "url": "https://linear.app/chewcorp/issue/CCP-123",
+        "updatedAt": "2026-10-16T12:00:00.000Z",
+    }
+    assert (code, err, calls) == (0, "", [])
+    assert out == json.dumps(expected, indent=2, ensure_ascii=False) + "\n"
+
+
+def test_issue_get_comments_since() -> None:
+    since = "2026-10-16T00:00:00Z"
+    post, sent = _serve(
+        [
+            _shown_issue(
+                assignee={"name": "ada", "displayName": "Ada"},
+                comments={
+                    "nodes": [
+                        {
+                            "url": "https://linear.app/comment/b",
+                            "createdAt": "2026-10-16T02:00:00.000Z",
+                            "body": "second",
+                            "user": {"name": "ada", "displayName": "Ada"},
+                        },
+                        {
+                            "url": "https://linear.app/comment/a",
+                            "createdAt": "2026-10-16T01:00:00.000Z",
+                            "body": "first",
+                            "user": {"name": "grace", "displayName": ""},
+                        },
+                        {
+                            "url": "https://linear.app/comment/c",
+                            "createdAt": "2026-10-16T03:00:00.000Z",
+                            "body": "third",
+                            "user": {"name": "", "displayName": ""},
+                        },
+                    ]
+                },
+            )
+        ]
+    )
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123", "--comments-since", since],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, err, calls) == (0, "", [])
+    loaded = json.loads(out)
+    assert loaded["assignee"] == "Ada"
+    assert loaded["comments"] == [
+        {
+            "url": "https://linear.app/comment/b",
+            "createdAt": "2026-10-16T02:00:00.000Z",
+            "body": "second",
+            "user": "Ada",
+        },
+        {
+            "url": "https://linear.app/comment/a",
+            "createdAt": "2026-10-16T01:00:00.000Z",
+            "body": "first",
+            "user": "grace",
+        },
+        {
+            "url": "https://linear.app/comment/c",
+            "createdAt": "2026-10-16T03:00:00.000Z",
+            "body": "third",
+            "user": None,
+        },
+    ]
+    assert _posted(sent) == [
+        (
+            "LinearCliIssueGet",
+            {"id": "CCP-123", "withComments": True, "since": since},
+        )
+    ]
+    query = sent[0]["query"]
+    assert isinstance(query, str)
+    assert "createdAt: { gte: $since }" in query
+
+
+def test_issue_get_accepts_a_naive_since() -> None:
+    raw = "2026-10-16T00:00:00"
+    post, sent = _serve([_shown_issue(comments={"nodes": []})])
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123", "--comments-since", raw],
+        environ=_KEY,
+        post=post,
+    )
+    assert code == 0
+    assert err == ""
+    assert calls == []
+    assert "comments" in json.loads(out)
+    assert sent[0]["variables"] == {
+        "id": "CCP-123",
+        "withComments": True,
+        "since": raw,
+    }
+
+
+def test_issue_get_rejects_unparseable_since() -> None:
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123", "--comments-since", "yesterday"],
+        environ=_KEY,
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert err == "linear-cli: --comments-since must be an ISO-8601 time\n"
+
+
+def test_issue_get_unknown_issue() -> None:
+    post, sent = _serve([{"data": {"issue": None}}])
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-999"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, out, err) == (1, "", "linear-cli: unknown issue CCP-999\n")
+    assert calls == []
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize(
+    ("cycle", "expected"),
+    [
+        ({"name": "Cycle 12", "number": 12}, "Cycle 12"),
+        ({"name": "", "number": 12}, "12"),
+        ({"name": "", "number": 12.0}, "12"),
+        ({"name": None, "number": 12.5}, "12.5"),
+        ({"name": "", "number": True}, None),
+        ({"name": "", "number": False}, None),
+        (None, None),
+        ({"number": "12"}, None),
+    ],
+)
+def test_issue_get_renders_cycle(cycle: object, expected: object) -> None:
+    post, _sent = _serve([_shown_issue(cycle=cycle)])
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, err, calls) == (0, "", [])
+    assert json.loads(out)["cycle"] == expected
+
+
+@pytest.mark.parametrize(
+    ("priority", "estimate", "expected_priority", "expected_estimate"),
+    [
+        (2, 3, 2, 3),
+        (0, 0.0, 0, 0.0),
+        (2.5, 1.5, 2.5, 1.5),
+        (True, False, None, None),
+        ("2", "3", None, None),
+    ],
+)
+def test_issue_get_keeps_only_numeric_priority_and_estimate(
+    priority: object,
+    estimate: object,
+    expected_priority: object,
+    expected_estimate: object,
+) -> None:
+    post, _sent = _serve([_shown_issue(priority=priority, estimate=estimate)])
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, err, calls) == (0, "", [])
+    loaded = json.loads(out)
+    assert loaded["priority"] == expected_priority
+    assert loaded["estimate"] == expected_estimate
+
+
+@pytest.mark.parametrize("key", ["identifier", "title", "url", "updatedAt"])
+def test_issue_get_rejects_a_non_string_field(key: str) -> None:
+    post, sent = _serve([_shown_issue(**{key: None})])
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, out, calls) == (1, "", [])
+    assert err == f"linear-cli: issue lookup returned no {key}\n"
+    assert len(sent) == 1
+
+
+def test_issue_move_prints_old_and_new_state() -> None:
+    post, sent = _serve(
+        [
+            _move_lookup([{"id": "state-review", "name": "In Review"}]),
+            {"data": {"issueUpdate": {"success": True}}},
+        ]
+    )
+    code, out, err, calls = _run(
+        ["issue", "move", "CCP-123", "--state", "In Review"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, out, err) == (0, "Todo → In Review\n", "")
+    assert calls == []
+    assert _posted(sent) == [
+        ("LinearCliMoveLookup", {"id": "CCP-123", "state": "In Review"}),
+        ("LinearCliIssueMove", {"id": "issue-uuid", "stateId": "state-review"}),
+    ]
+    query = sent[0]["query"]
+    assert isinstance(query, str)
+    assert "name: { eq: $state }" in query
+    assert "states(first: 50, filter: { name: { eq: $state } })" in query
+
+
+@pytest.mark.parametrize(
+    ("states", "message"),
+    [
+        ([], "unknown state 'Done' for CCP-123"),
+        (
+            [{"id": "s1", "name": "Done"}, {"id": "s2", "name": "Done"}],
+            "ambiguous state 'Done' for CCP-123: 2 matches",
+        ),
+    ],
+)
+def test_issue_move_needs_exactly_one_state(
+    states: list[dict[str, object]], message: str
+) -> None:
+    post, sent = _serve([_move_lookup(states)])
+    code, out, err, calls = _run(
+        ["issue", "move", "CCP-123", "--state", "Done"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, out, err) == (1, "", f"linear-cli: {message}\n")
+    assert calls == []
+    assert _posted(sent) == [
+        ("LinearCliMoveLookup", {"id": "CCP-123", "state": "Done"}),
+    ]
+
+
+def test_issue_move_unknown_issue() -> None:
+    post, sent = _serve([{"data": {"issue": None}}])
+    code, out, err, calls = _run(
+        ["issue", "move", "CCP-999", "--state", "Done"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, out, err) == (1, "", "linear-cli: unknown issue CCP-999\n")
+    assert calls == []
+    assert _posted(sent) == [
+        ("LinearCliMoveLookup", {"id": "CCP-999", "state": "Done"}),
+    ]
+
+
+def test_issue_move_lookup_errors_stop_before_the_write() -> None:
+    post, sent = _serve([{"errors": [{"message": "nope"}]}])
+    code, out, err, calls = _run(
+        ["issue", "move", "CCP-123", "--state", "Done"],
+        environ=_KEY,
+        post=post,
+    )
+    assert code == 1
+    assert out == ""
+    assert err == ("linear-cli: GraphQL response contains errors\nlinear-cli: nope\n")
+    assert calls == []
+    assert _posted(sent) == [
+        ("LinearCliMoveLookup", {"id": "CCP-123", "state": "Done"}),
+    ]
+
+
+def test_issue_move_update_failure() -> None:
+    post, sent = _serve(
+        [
+            _move_lookup([{"id": "state-review", "name": "In Review"}]),
+            {"data": {"issueUpdate": {"success": False}}},
+        ]
+    )
+    code, out, err, calls = _run(
+        ["issue", "move", "CCP-123", "--state", "In Review"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, out, err) == (
+        1,
+        "",
+        "linear-cli: issueUpdate returned success: false\n",
+    )
+    assert calls == []
+    assert [name for name, _variables in _posted(sent)] == [
+        "LinearCliMoveLookup",
+        "LinearCliIssueMove",
+    ]
+
+
+def test_shortcut_transport_failure() -> None:
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123"],
+        environ=_KEY,
+        reply=_HttpReply(500, "Server Error", b"boom"),
+    )
+    assert (code, out, err) == (1, "", "linear-cli: HTTP 500 boom\n")
+    assert len(calls) == 1
