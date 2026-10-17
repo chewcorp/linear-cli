@@ -630,7 +630,11 @@ def _selection(fields: tuple[tuple[str, tuple[str, ...]], ...]) -> str:
 
 
 def _issues_changed_operation(
-    teams: tuple[str, ...], since: datetime, with_comments: bool
+    teams: tuple[str, ...],
+    since: datetime,
+    with_comments: bool,
+    *,
+    until: datetime | None = None,
 ) -> GraphQLOperation:
     comments = ""
     if with_comments:
@@ -639,18 +643,27 @@ def _issues_changed_operation(
             f"{_COMMENT_PAGE_SIZE}, filter: {{createdAt: {{gt: $since}}}}) "
             f"{{ nodes {{ {_selection(_COMMENT_FIELDS)} }} }}"
         )
+    updated = "gt: $since"
+    declared = "$after: String, $since: DateTimeOrDuration!"
+    variables: JsonObject = {
+        "after": None,
+        "since": _iso(since),
+        "teams": list(teams),
+    }
+    if until is not None:
+        updated = "gt: $since, lte: $until"
+        declared = (
+            "$after: String, $since: DateTimeOrDuration!, $until: DateTimeOrDuration!"
+        )
+        variables["until"] = _iso(until)
     document = (
-        "query IssuesChanged($after: String, $since: DateTimeOrDuration!, "
-        "$teams: [String!]!) { "
+        f"query IssuesChanged({declared}, $teams: [String!]!) {{ "
         f"issues(first: {_ISSUE_PAGE_SIZE}, after: $after, orderBy: updatedAt, "
-        "filter: {updatedAt: {gt: $since}, team: {key: {in: $teams}}}) { "
+        f"filter: {{updatedAt: {{{updated}}}, team: {{key: {{in: $teams}}}}}}) {{ "
         f"nodes {{ {_selection(_ISSUE_FIELDS)}{comments} }} "
         "pageInfo { hasNextPage endCursor } } }"
     )
-    return GraphQLOperation(
-        document,
-        {"after": None, "since": _iso(since), "teams": list(teams)},
-    )
+    return GraphQLOperation(document, variables)
 
 
 def _at(node: JsonValue, path: tuple[str, ...]) -> JsonValue:
@@ -731,7 +744,12 @@ def _issues_changed(
         case Resume(at, state_file):
             pass
     response = client.paginate(
-        _issues_changed_operation(command.teams, at, command.with_comments)
+        _issues_changed_operation(
+            command.teams,
+            at,
+            command.with_comments,
+            until=now if state_file is not None else None,
+        )
     )
     if response.has_errors:
         return _report(stderr, response)

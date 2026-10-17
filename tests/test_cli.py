@@ -1007,6 +1007,38 @@ def test_issues_changed_state_file_advances_only_after_success(tmp_path: Path) -
     assert sent[0]["variables"]["since"] == "2026-10-17T09:00:00.000Z"
 
 
+def test_state_file_pages_stop_at_the_run_start(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    state.write_text("2026-10-17T09:00:00.000Z\n")
+    post, sent = _serve(
+        [
+            _connection([_issue("CCP-1")], "c1", True),
+            _connection([_issue("CCP-2")], "c2", False),
+        ]
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--state-file", str(state)],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert [json.loads(line)["identifier"] for line in out.splitlines()] == [
+        "CCP-1",
+        "CCP-2",
+    ]
+    written = state.read_text().strip()
+    assert sent[0]["variables"]["since"] == "2026-10-17T09:00:00.000Z"
+    assert sent[0]["variables"]["until"] == written
+    assert sent[1]["variables"]["until"] == written
+    assert sent[1]["variables"]["after"] == "c1"
+    for body in sent:
+        query = body["query"]
+        assert isinstance(query, str)
+        assert "updatedAt: {gt: $since, lte: $until}" in query
+
+
 def test_issues_changed_leaves_state_file_on_failure(tmp_path: Path) -> None:
     state = tmp_path / "wake"
     original = "2026-10-17T09:00:00.000Z\n"
