@@ -1,6 +1,6 @@
 [project]
 name = "linear-cli"
-version = "0.1.0"
+version = "0.1.1"
 description = "Minimal Linear CLI adapter for agents"
 readme = "README.md"
 license = "MIT"

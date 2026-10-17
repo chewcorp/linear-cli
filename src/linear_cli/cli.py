@@ -5,10 +5,14 @@ import json
 import math
 import os
 import sys
+import tomllib
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from http.client import IncompleteRead
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
+from pathlib import Path
 from typing import Final, Protocol, TextIO, TypeAlias
 from urllib.error import HTTPError, URLError
 
@@ -143,6 +147,8 @@ class FetchSchema:
 @dataclass(frozen=True, slots=True)
 class ExecuteOperation:
     operation: GraphQLOperation
+    compact: bool
+    data_only: bool
 
 
 Invocation: TypeAlias = FetchSchema | ExecuteOperation
@@ -196,9 +202,17 @@ def parse_invocation(
     stdout: TextIO,
     stderr: TextIO,
 ) -> Invocation:
+    if "--version" in argv:
+        stdout.write(f"{_package_version()}\n")
+        raise _ParserExit(0)
     parser = _bind_parser(stdout, stderr)(
         prog="linear-cli",
         description="Use Linear through its published GraphQL schema.",
+    )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="show the package version and exit",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("schema", help="fetch the live GraphQL schema")
@@ -208,6 +222,16 @@ def parse_invocation(
         default="{}",
         metavar="JSON",
         help="JSON object of variables",
+    )
+    graphql.add_argument(
+        "--compact",
+        action="store_true",
+        help="print minified JSON",
+    )
+    graphql.add_argument(
+        "--data",
+        action="store_true",
+        help="print only the data object",
     )
     graphql.add_argument(
         "document",
@@ -221,7 +245,9 @@ def parse_invocation(
         GraphQLOperation(
             document=_document(namespace.document, stdin),
             variables=_variables(namespace.variables),
-        )
+        ),
+        compact=namespace.compact,
+        data_only=namespace.data,
     )
 
 
@@ -287,10 +313,16 @@ def main(
     except LocalInputError as exc:
         _write_line(stderr, str(exc))
         return 2
+    compact = False
+    data_only = False
     match invocation:
         case FetchSchema():
             operation = GraphQLOperation(INTROSPECTION_QUERY, {})
-        case ExecuteOperation(operation=operation):
+        case ExecuteOperation(
+            operation=operation,
+            compact=compact,
+            data_only=data_only,
+        ):
             pass
         case _:
             _write_line(stderr, "unknown command")
@@ -300,8 +332,14 @@ def main(
     except RemoteFailure as exc:
         _write_line(stderr, str(exc))
         return 1
-    stdout.write(json.dumps(response.payload, indent=2, ensure_ascii=False))
-    stdout.write("\n")
+    shown = response.payload.get("data") if data_only else response.payload
+    if not (data_only and response.has_errors and shown is None):
+        if compact:
+            rendered = json.dumps(shown, ensure_ascii=False, separators=(",", ":"))
+        else:
+            rendered = json.dumps(shown, indent=2, ensure_ascii=False)
+        stdout.write(rendered)
+        stdout.write("\n")
     if not response.has_errors:
         return 0
     _write_line(stderr, "GraphQL response contains errors")
@@ -421,6 +459,27 @@ def _collapse(text: str, secret: str, limit: int = 200) -> str:
 
 def _write_line(stream: TextIO, message: str) -> None:
     stream.write(f"linear-cli: {message}\n")
+
+
+def _package_version() -> str:
+    try:
+        return package_version("linear-cli")
+    except PackageNotFoundError:
+        return _pyproject_version() or "unknown"
+
+
+def _pyproject_version() -> str | None:
+    path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    try:
+        project = tomllib.loads(path.read_text(encoding="utf-8")).get("project")
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    if not isinstance(project, dict):
+        return None
+    version = project.get("version")
+    if isinstance(version, str) and version:
+        return version
+    return None
 
 
 def _bind_parser(stdout: TextIO, stderr: TextIO) -> type[argparse.ArgumentParser]:

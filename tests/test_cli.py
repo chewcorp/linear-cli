@@ -8,6 +8,8 @@ import urllib.request
 from collections.abc import Mapping
 from http.client import HTTPMessage, IncompleteRead
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from typing import Self
 from urllib.error import HTTPError, URLError
 
@@ -83,9 +85,57 @@ def test_help() -> None:
     assert code == 0
     assert err == ""
     assert calls == []
-    assert out.splitlines()[0] == "usage: linear-cli [-h] {schema,graphql} ..."
+    assert (
+        out.splitlines()[0] == "usage: linear-cli [-h] [--version] {schema,graphql} ..."
+    )
     assert "schema" in out
     assert "graphql" in out
+
+
+def test_version() -> None:
+    code, out, err, calls = _run(["--version"])
+    assert code == 0
+    assert err == ""
+    assert calls == []
+    assert out == "0.1.1\n"
+    assert out.strip() == package_version("linear-cli")
+
+
+def test_bad_argv_skips_package_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(_name: str) -> str:
+        raise PackageNotFoundError
+
+    monkeypatch.setattr(cli_mod, "package_version", missing)
+    code, out, err, calls = _run(["a", "a"])
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert "PackageNotFoundError" not in err
+
+
+def test_version_falls_back_to_pyproject(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(_name: str) -> str:
+        raise PackageNotFoundError
+
+    monkeypatch.setattr(cli_mod, "package_version", missing)
+    code, out, err, calls = _run(["--version"])
+    assert code == 0
+    assert err == ""
+    assert calls == []
+    assert out == "0.1.1\n"
+
+
+def test_version_unknown_without_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(_name: str) -> str:
+        raise PackageNotFoundError
+
+    monkeypatch.setattr(cli_mod, "package_version", missing)
+    monkeypatch.setattr(cli_mod, "_pyproject_version", lambda: None)
+    code, out, err, calls = _run(["--version"])
+    assert code == 0
+    assert err == ""
+    assert calls == []
+    assert out == "unknown\n"
 
 
 def test_schema_help() -> None:
@@ -101,10 +151,11 @@ def test_graphql_help() -> None:
     assert code == 0
     assert err == ""
     assert calls == []
-    assert out.splitlines()[0] == (
-        "usage: linear-cli graphql [-h] [--variables JSON] DOCUMENT"
-    )
-    assert "graphql" in out
+    assert out.splitlines()[0].startswith("usage: linear-cli graphql [-h] ")
+    assert "[--variables JSON]" in out
+    assert "[--compact]" in out
+    assert "[--data]" in out
+    assert "DOCUMENT" in out
 
 
 def test_missing_credential() -> None:
@@ -227,6 +278,89 @@ def test_graphql_errors_on_http_400() -> None:
     assert err == (
         "linear-cli: GraphQL response contains errors\n" f"linear-cli: {message}\n"
     )
+    assert len(calls) == 1
+
+
+def test_graphql_compact() -> None:
+    code, out, err, calls = _run(
+        ["graphql", "--compact", VIEWER_QUERY],
+        environ={"LINEAR_API_KEY": "lin_api_test"},
+        reply=_HttpReply(
+            200,
+            "OK",
+            b'{ "data" : { "viewer" : { "id" : "u1" } } }',
+        ),
+    )
+    assert code == 0
+    assert err == ""
+    assert out == '{"data":{"viewer":{"id":"u1"}}}\n'
+    assert len(calls) == 1
+    assert calls[0]["body"] == VIEWER_BODY
+
+
+def test_graphql_data() -> None:
+    code, out, err, calls = _run(
+        ["graphql", "--data", VIEWER_QUERY],
+        environ={"LINEAR_API_KEY": "lin_api_test"},
+        reply=_HttpReply(200, "OK", b'{"data":{"viewer":{"id":"u1"}}}'),
+    )
+    assert code == 0
+    assert err == ""
+    assert out == json.dumps({"viewer": {"id": "u1"}}, indent=2) + "\n"
+    assert len(calls) == 1
+
+
+def test_graphql_compact_and_data() -> None:
+    code, out, err, calls = _run(
+        ["graphql", "--compact", "--data", VIEWER_QUERY],
+        environ={"LINEAR_API_KEY": "lin_api_test"},
+        reply=_HttpReply(
+            200,
+            "OK",
+            b'{ "data" : { "viewer" : { "id" : "u1" } } }',
+        ),
+    )
+    assert code == 0
+    assert err == ""
+    assert out == '{"viewer":{"id":"u1"}}\n'
+    assert len(calls) == 1
+
+
+def test_graphql_data_omits_null_on_errors() -> None:
+    message = 'Cannot query field "nope" on type "Query".'
+    payload = {"errors": [{"message": message}]}
+    code, out, err, calls = _run(
+        ["graphql", "--data", VIEWER_QUERY],
+        environ={"LINEAR_API_KEY": "lin_api_test"},
+        reply=_HttpReply(400, "Bad Request", json.dumps(payload).encode()),
+    )
+    assert code == 1
+    assert out == ""
+    assert err == (
+        "linear-cli: GraphQL response contains errors\n" f"linear-cli: {message}\n"
+    )
+    assert "null" not in out
+    assert len(calls) == 1
+
+
+def test_graphql_data_keeps_errors() -> None:
+    payload = {
+        "data": {"viewer": {"id": "u1"}},
+        "errors": [{"message": "one"}, {"message": "two"}],
+    }
+    code, out, err, calls = _run(
+        ["graphql", "--data", "--compact", VIEWER_QUERY],
+        environ={"LINEAR_API_KEY": "lin_api_test"},
+        reply=_HttpReply(200, "OK", json.dumps(payload).encode()),
+    )
+    assert code == 1
+    assert out == '{"viewer":{"id":"u1"}}\n'
+    assert err == (
+        "linear-cli: GraphQL response contains errors\n"
+        "linear-cli: one\n"
+        "linear-cli: two\n"
+    )
+    assert "lin_api_test" not in err
     assert len(calls) == 1
 
 
