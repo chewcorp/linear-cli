@@ -6,10 +6,12 @@ import sys
 import threading
 import urllib.request
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from http.client import HTTPMessage, IncompleteRead
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
+from pathlib import Path
 from typing import Self
 from urllib.error import HTTPError, URLError
 
@@ -86,7 +88,8 @@ def test_help() -> None:
     assert err == ""
     assert calls == []
     assert (
-        out.splitlines()[0] == "usage: linear-cli [-h] [--version] {schema,graphql} ..."
+        out.splitlines()[0]
+        == "usage: linear-cli [-h] [--version] {schema,graphql,issues} ..."
     )
     assert "schema" in out
     assert "graphql" in out
@@ -746,3 +749,379 @@ def test_module_help() -> None:
     assert proc.returncode == 0
     assert "schema" in proc.stdout
     assert "graphql" in proc.stdout
+    assert "issues" in proc.stdout
+
+
+_KEY = {"LINEAR_API_KEY": "lin_api_test"}
+_PAGE_QUERY = (
+    "query ($after: String) { issues(first: 2, after: $after) "
+    "{ nodes { identifier } pageInfo { hasNextPage endCursor } } }"
+)
+
+
+def _connection(
+    nodes: list[dict[str, object]], cursor: str | None, has_next: bool
+) -> dict[str, object]:
+    return {
+        "data": {
+            "issues": {
+                "nodes": nodes,
+                "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+            }
+        }
+    }
+
+
+def _serve(
+    payloads: list[dict[str, object]],
+) -> tuple[_HttpPost, list[dict[str, object]]]:
+    sent: list[dict[str, object]] = []
+    remaining = list(payloads)
+
+    def post(
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        timeout_seconds: float,
+    ) -> _HttpReply:
+        del url, headers, timeout_seconds
+        sent.append(json.loads(body))
+        if not remaining:
+            raise AssertionError("unexpected HTTP POST")
+        return _HttpReply(200, "OK", json.dumps(remaining.pop(0)).encode())
+
+    return post, sent
+
+
+def _issue(
+    identifier: str,
+    *,
+    team: str = "CCP",
+    comments: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    node: dict[str, object] = {
+        "identifier": identifier,
+        "title": f"Title {identifier}",
+        "state": {"name": "Todo"},
+        "assignee": None,
+        "priority": 0,
+        "estimate": None,
+        "cycle": None,
+        "updatedAt": "2026-10-17T12:00:00.000Z",
+        "url": f"https://linear.app/chewcorp/issue/{identifier}",
+    }
+    if comments is not None:
+        node["comments"] = {"nodes": comments}
+    node["team"] = team
+    return node
+
+
+def test_paginate_merges_nodes() -> None:
+    post, sent = _serve(
+        [
+            _connection([{"identifier": "CCP-1"}], "c1", True),
+            _connection([{"identifier": "CPB-2"}], "c2", False),
+        ]
+    )
+    code, out, err, calls = _run(
+        ["graphql", "--paginate", "--data", "--compact", _PAGE_QUERY],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out) == {
+        "issues": {
+            "nodes": [{"identifier": "CCP-1"}, {"identifier": "CPB-2"}],
+            "pageInfo": {"hasNextPage": False, "endCursor": "c2"},
+        }
+    }
+    assert sent[1]["variables"] == {"after": "c1"}
+
+
+def test_paginate_rejects_document_without_after() -> None:
+    code, out, err, calls = _run(
+        ["graphql", "--paginate", "query { viewer { id } }"],
+        environ=_KEY,
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert "$after" in err
+
+
+def test_paginate_ignores_connections_inside_nodes() -> None:
+    payload = _connection(
+        [
+            {
+                "identifier": "CCP-1",
+                "comments": {
+                    "nodes": [{"body": "hi"}],
+                    "pageInfo": {"hasNextPage": False, "endCursor": "comment-cursor"},
+                },
+            }
+        ],
+        None,
+        False,
+    )
+    post, _sent = _serve([payload])
+    code, out, err, calls = _run(
+        ["graphql", "--paginate", "--data", "--compact", _PAGE_QUERY],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)["issues"]["nodes"][0]["identifier"] == "CCP-1"
+
+
+def test_paginate_rejects_two_connections() -> None:
+    payload = _connection([], None, False)
+    assert isinstance(payload["data"], dict)
+    payload["data"]["projects"] = {
+        "nodes": [],
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+    }
+    post, _sent = _serve([payload])
+    code, out, err, calls = _run(
+        ["graphql", "--paginate", _PAGE_QUERY],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 1
+    assert out == ""
+    assert "exactly one connection, found 2" in err
+
+
+def test_paginate_stops_when_cursor_repeats() -> None:
+    post, sent = _serve(
+        [
+            _connection([{"identifier": "CCP-1"}], "a", True),
+            _connection([{"identifier": "CCP-2"}], "b", True),
+            _connection([{"identifier": "CCP-3"}], "a", True),
+        ]
+    )
+    code, out, err, calls = _run(
+        ["graphql", "--paginate", _PAGE_QUERY],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 1
+    assert out == ""
+    assert "cursor did not advance" in err
+    assert len(sent) == 3
+
+
+def test_paginate_does_not_merge_an_error_page() -> None:
+    post, _sent = _serve(
+        [
+            _connection([{"identifier": "CCP-1"}], "c1", True),
+            {
+                "errors": [{"message": "boom"}],
+                "data": _connection([{"identifier": "CCP-2"}], None, False)["data"],
+            },
+        ]
+    )
+    code, out, err, calls = _run(
+        ["graphql", "--paginate", "--compact", _PAGE_QUERY],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 1
+    assert "CCP-1" not in out
+    assert "boom" in err
+
+
+def test_issues_changed_filters_named_teams() -> None:
+    nodes = [_issue("CCP-1"), _issue("BRD-2", team="BRD")]
+    post, sent = _serve([_connection(nodes, None, False)])
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            " CCP, CPB, CCP, BRD ",
+            "--since",
+            "2026-10-17T09:00:00Z",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert [line["identifier"] for line in lines] == ["CCP-1", "BRD-2"]
+    assert list(lines[0]) == [
+        "identifier",
+        "title",
+        "state",
+        "assignee",
+        "priority",
+        "estimate",
+        "cycle",
+        "updatedAt",
+        "url",
+    ]
+    assert lines[0]["state"] == "Todo"
+    assert lines[0]["assignee"] is None
+    assert lines[0]["priority"] == 0
+    assert lines[0]["cycle"] is None
+    body = sent[0]
+    assert body["variables"] == {
+        "after": None,
+        "since": "2026-10-17T09:00:00.000Z",
+        "teams": ["CCP", "CPB", "BRD"],
+    }
+    query = body["query"]
+    assert isinstance(query, str)
+    assert "updatedAt: {gt: $since}" in query
+    assert "team: {key: {in: $teams}}" in query
+    assert "orderBy: updatedAt" in query
+    assert "comments(" not in query
+
+
+def test_issues_changed_state_file_advances_only_after_success(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    state.write_text("2026-10-17T09:00:00.000Z\n")
+    post, sent = _serve([_connection([_issue("CCP-1")], None, False)])
+    before = datetime.now(UTC)
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--state-file", str(state)],
+        environ=_KEY,
+        post=post,
+    )
+    after = datetime.now(UTC)
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)["identifier"] == "CCP-1"
+    stored = datetime.fromisoformat(state.read_text().strip())
+    assert before - timedelta(milliseconds=5) <= stored <= after
+    assert sent[0]["variables"]["since"] == "2026-10-17T09:00:00.000Z"
+
+
+def test_issues_changed_leaves_state_file_on_failure(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    original = "2026-10-17T09:00:00.000Z\n"
+    state.write_text(original)
+    post, sent = _serve(
+        [
+            _connection([_issue("CCP-1")], "c1", True),
+            {"errors": [{"message": "boom"}]},
+        ]
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--state-file", str(state)],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 1
+    assert out == ""
+    assert "boom" in err
+    assert state.read_text() == original
+    assert sent[1]["variables"]["after"] == "c1"
+
+
+def test_issues_changed_baselines_a_missing_state_file(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    before = datetime.now(UTC)
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP,CPB,BRD", "--state-file", str(state)],
+        environ=_KEY,
+    )
+    after = datetime.now(UTC)
+    assert code == 0
+    assert out == ""
+    assert err == ""
+    assert calls == []
+    stored = datetime.fromisoformat(state.read_text().strip())
+    assert before - timedelta(milliseconds=5) <= stored <= after
+
+
+def test_issues_changed_does_not_baseline_without_a_token(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--state-file", str(state)],
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert "LINEAR_API_KEY" in err
+    assert not state.exists()
+
+
+def test_issues_changed_rejects_a_naive_since() -> None:
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--since", "2026-10-17T09:00:00"],
+        environ=_KEY,
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert "timezone" in err
+
+
+def test_issues_changed_rejects_a_bad_state_file(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    state.write_text("\n")
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--state-file", str(state)],
+        environ=_KEY,
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert state.read_text() == "\n"
+    assert "empty" in err
+
+
+def test_issues_changed_includes_comments_since_the_watermark() -> None:
+    body = "x" * 300
+    node = _issue(
+        "CCP-9",
+        comments=[
+            {
+                "body": body,
+                "createdAt": "2026-10-17T12:30:00.000Z",
+                "user": {"displayName": "Ada"},
+            }
+        ],
+    )
+    post, sent = _serve([_connection([node], None, False)])
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--since",
+            "2026-10-17T09:00:00+00:00",
+            "--with-comments",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    line = json.loads(out)
+    assert line["comments"] == [
+        {
+            "author": "Ada",
+            "createdAt": "2026-10-17T12:30:00.000Z",
+            "body": "x" * 280,
+        }
+    ]
+    query = sent[0]["query"]
+    assert isinstance(query, str)
+    assert "comments(" in query
+    assert "createdAt: {gt: $since}" in query
+    assert sent[0]["variables"]["since"] == "2026-10-17T09:00:00.000Z"
