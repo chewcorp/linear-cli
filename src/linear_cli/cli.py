@@ -945,8 +945,9 @@ def _issues_changed(
 
 # Links per issue; a card with more is left off the frontier, not half-checked.
 _READY_LINK_PAGE: Final[int] = 20
-# Russell's actions live on the BRD team; an open linked BRD card holds the work.
+# Russell's decisions live on the BRD team; an undecided BRD blocker holds the work.
 _RUSSELL_TEAM: Final[str] = "BRD"
+_RUSSELL_DECIDED: Final[frozenset[str]] = frozenset({"Approved", "Adjudicated"})
 _READY_QUERY: Final[str] = f"""
 query IssuesReady($after: String, $teams: [String!]!) {{
   issues(first: {_ISSUE_PAGE_SIZE}, after: $after, filter: {{
@@ -962,11 +963,9 @@ query IssuesReady($after: String, $teams: [String!]!) {{
         nodes {{ name parent {{ name }} }} pageInfo {{ hasNextPage }}
       }}
       inverseRelations(first: {_READY_LINK_PAGE}) {{
-        nodes {{ type issue {{ team {{ key }} completedAt canceledAt }} }}
-        pageInfo {{ hasNextPage }}
-      }}
-      relations(first: {_READY_LINK_PAGE}) {{
-        nodes {{ type relatedIssue {{ team {{ key }} completedAt canceledAt }} }}
+        nodes {{
+          type issue {{ team {{ key }} state {{ name }} completedAt canceledAt }}
+        }}
         pageInfo {{ hasNextPage }}
       }}
       attachments(first: {_READY_LINK_PAGE}) {{
@@ -983,6 +982,14 @@ def _open(issue: JsonValue) -> bool:
     return _at(issue, ("completedAt",)) is None and _at(issue, ("canceledAt",)) is None
 
 
+def _gates(blocker: JsonValue) -> bool:
+    # A decided BRD card stays in a started state until its work lands, so it no longer gates.
+    decided = _at(blocker, ("state", "name")) in _RUSSELL_DECIDED
+    return _open(blocker) and not (
+        _at(blocker, ("team", "key")) == _RUSSELL_TEAM and decided
+    )
+
+
 def _ready(node: JsonValue) -> bool:
     if not isinstance(node, dict) or node.get("delegate") is not None:
         return False
@@ -991,7 +998,7 @@ def _ready(node: JsonValue) -> bool:
         return False
     if "russell's action" in description.lower():
         return False
-    links = ("labels", "inverseRelations", "relations", "attachments")
+    links = ("labels", "inverseRelations", "attachments")
     if any(_at(node, (key, "pageInfo", "hasNextPage")) is not False for key in links):
         return False
     if any(
@@ -999,16 +1006,11 @@ def _ready(node: JsonValue) -> bool:
         for label in _nodes(node.get("labels"))
     ):
         return False
-    for relation in _nodes(node.get("inverseRelations")):
-        other = _at(relation, ("issue",))
-        if _at(relation, ("type",)) == "blocks" and _open(other):
-            return False
-        if _at(other, ("team", "key")) == _RUSSELL_TEAM and _open(other):
-            return False
-    for relation in _nodes(node.get("relations")):
-        other = _at(relation, ("relatedIssue",))
-        if _at(other, ("team", "key")) == _RUSSELL_TEAM and _open(other):
-            return False
+    if any(
+        _at(relation, ("type",)) == "blocks" and _gates(_at(relation, ("issue",)))
+        for relation in _nodes(node.get("inverseRelations"))
+    ):
+        return False
     # A merged PR already linked means the card was delivered and only awaits closure.
     return not any(
         _at(attachment, ("metadata", "status")) == "merged"
