@@ -276,6 +276,11 @@ class IssuesChanged:
 
 
 @dataclass(frozen=True, slots=True)
+class IssuesReady:
+    teams: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class GetIssue:
     issue: str
     comments_since: str | None
@@ -295,7 +300,9 @@ class MoveIssue:
 
 Shortcut: TypeAlias = GetIssue | PostComment | MoveIssue
 
-Invocation: TypeAlias = FetchSchema | ExecuteOperation | IssuesChanged | Shortcut
+Invocation: TypeAlias = (
+    FetchSchema | ExecuteOperation | IssuesChanged | IssuesReady | Shortcut
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,6 +438,11 @@ def parse_invocation(
         action="store_true",
         help="include comments created since the same time",
     )
+    ready = issue_commands.add_parser(
+        "ready",
+        help="frontier: unstarted, estimated, specced, unblocked, unclaimed issues",
+    )
+    ready.add_argument("--team", required=True, help="comma-separated team keys")
     comment = commands.add_parser("comment", help="post a comment on an issue")
     comment.add_argument(
         "issue", metavar="ISSUE", help="issue identifier, e.g. CCP-123"
@@ -461,6 +473,8 @@ def parse_invocation(
     namespace = parser.parse_args(list(argv))
     if namespace.command == "schema":
         return FetchSchema()
+    if namespace.command == "issues" and namespace.issues_command == "ready":
+        return IssuesReady(_team_keys(namespace.team))
     if namespace.command == "issues":
         return IssuesChanged(
             teams=_team_keys(namespace.team),
@@ -602,6 +616,14 @@ def main(
             paginate=paginate,
         ):
             pass
+        case IssuesReady(teams=teams):
+            try:
+                return _issues_ready(GraphQLClient(credential, post), teams, stdout)
+            except GraphQLErrors as exc:
+                return _report(stderr, exc.response)
+            except RemoteFailure as exc:
+                _write_line(stderr, str(exc))
+                return 1
         case IssuesChanged() as command:
             try:
                 return _issues_changed(
@@ -918,6 +940,108 @@ def _issues_changed(
         stdout.write("\n".join(lines) + "\n")
     if state_file is not None:
         _write_watermark(state_file, now)
+    return 0
+
+
+# Links per issue; a card with more is left off the frontier, not half-checked.
+_READY_LINK_PAGE: Final[int] = 20
+# Russell's actions live on the BRD team; an open linked BRD card holds the work.
+_RUSSELL_TEAM: Final[str] = "BRD"
+_READY_QUERY: Final[str] = f"""
+query IssuesReady($after: String, $teams: [String!]!) {{
+  issues(first: {_ISSUE_PAGE_SIZE}, after: $after, filter: {{
+    team: {{ key: {{ in: $teams }} }}
+    state: {{ type: {{ eq: "unstarted" }} }}
+    assignee: {{ null: true }}
+    estimate: {{ null: false }}
+  }}) {{
+    nodes {{
+      identifier title priority estimate url description
+      delegate {{ id }}
+      labels(first: {_READY_LINK_PAGE}) {{
+        nodes {{ name parent {{ name }} }} pageInfo {{ hasNextPage }}
+      }}
+      inverseRelations(first: {_READY_LINK_PAGE}) {{
+        nodes {{ type issue {{ team {{ key }} completedAt canceledAt }} }}
+        pageInfo {{ hasNextPage }}
+      }}
+      relations(first: {_READY_LINK_PAGE}) {{
+        nodes {{ type relatedIssue {{ team {{ key }} completedAt canceledAt }} }}
+        pageInfo {{ hasNextPage }}
+      }}
+      attachments(first: {_READY_LINK_PAGE}) {{
+        nodes {{ metadata }} pageInfo {{ hasNextPage }}
+      }}
+    }}
+    pageInfo {{ hasNextPage endCursor }}
+  }}
+}}
+"""
+
+
+def _open(issue: JsonValue) -> bool:
+    return _at(issue, ("completedAt",)) is None and _at(issue, ("canceledAt",)) is None
+
+
+def _ready(node: JsonValue) -> bool:
+    if not isinstance(node, dict) or node.get("delegate") is not None:
+        return False
+    description = node.get("description")
+    if not isinstance(description, str) or "done when" not in description.lower():
+        return False
+    if "russell's action" in description.lower():
+        return False
+    links = ("labels", "inverseRelations", "relations", "attachments")
+    if any(_at(node, (key, "pageInfo", "hasNextPage")) is not False for key in links):
+        return False
+    if any(
+        _at(label, ("parent", "name")) == "agent"
+        for label in _nodes(node.get("labels"))
+    ):
+        return False
+    for relation in _nodes(node.get("inverseRelations")):
+        other = _at(relation, ("issue",))
+        if _at(relation, ("type",)) == "blocks" and _open(other):
+            return False
+        if _at(other, ("team", "key")) == _RUSSELL_TEAM and _open(other):
+            return False
+    for relation in _nodes(node.get("relations")):
+        other = _at(relation, ("relatedIssue",))
+        if _at(other, ("team", "key")) == _RUSSELL_TEAM and _open(other):
+            return False
+    # A merged PR already linked means the card was delivered and only awaits closure.
+    return not any(
+        _at(attachment, ("metadata", "status")) == "merged"
+        for attachment in _nodes(node.get("attachments"))
+    )
+
+
+def _priority_rank(node: JsonValue) -> int:
+    priority = _at(node, ("priority",))
+    return priority if isinstance(priority, int) and priority > 0 else 5
+
+
+def _issues_ready(client: GraphQLClient, teams: tuple[str, ...], stdout: TextIO) -> int:
+    response = client.paginate(
+        GraphQLOperation(_READY_QUERY, {"after": None, "teams": list(teams)})
+    )
+    if response.has_errors:
+        raise GraphQLErrors(response)
+    nodes = [n for n in _read_page(_data(response), ("issues",)).nodes if _ready(n)]
+    nodes.sort(key=_priority_rank)
+    fields = (
+        ("identifier", ("identifier",)),
+        ("title", ("title",)),
+        ("priority", ("priority",)),
+        ("estimate", ("estimate",)),
+        ("url", ("url",)),
+    )
+    lines = [
+        json.dumps(_project(n, fields), ensure_ascii=False, separators=(",", ":"))
+        for n in nodes
+    ]
+    if lines:
+        stdout.write("\n".join(lines) + "\n")
     return 0
 
 
