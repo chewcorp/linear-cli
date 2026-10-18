@@ -1734,3 +1734,96 @@ def test_shortcut_transport_failure() -> None:
     )
     assert (code, out, err) == (1, "", "linear-cli: HTTP 500 boom\n")
     assert len(calls) == 1
+
+
+def _ready_issue(identifier: str, **overrides: object) -> dict[str, object]:
+    node: dict[str, object] = {
+        "identifier": identifier,
+        "title": f"Title {identifier}",
+        "priority": 3,
+        "estimate": 2,
+        "url": f"https://linear.app/chewcorp/issue/{identifier}",
+        "description": "Task: x\nCriteria: y\nDone when: z",
+        "delegate": None,
+        "labels": {"nodes": []},
+        "inverseRelations": {"nodes": []},
+        "relations": {"nodes": []},
+        "attachments": {"nodes": []},
+    }
+    node.update(overrides)
+    return node
+
+
+def _closed(team: str = "CCP") -> dict[str, object]:
+    return {"team": {"key": team}, "completedAt": "2026-10-17T00:00:00Z"}
+
+
+def _open_issue(team: str = "CCP") -> dict[str, object]:
+    return {"team": {"key": team}, "completedAt": None, "canceledAt": None}
+
+
+def test_issues_ready_keeps_only_the_frontier() -> None:
+    nodes = [
+        _ready_issue("CCP-1", priority=0),
+        _ready_issue("CCP-2", priority=2),
+        _ready_issue("CCP-3", delegate={"id": "cursor"}),
+        _ready_issue("CCP-4", description="no acceptance text"),
+        _ready_issue("CCP-5", description="Done when: x. This is Russell's action."),
+        _ready_issue(
+            "CCP-6",
+            labels={"nodes": [{"name": "pe", "parent": {"name": "agent"}}]},
+        ),
+        _ready_issue(
+            "CCP-7",
+            inverseRelations={"nodes": [{"type": "blocks", "issue": _open_issue()}]},
+        ),
+        _ready_issue(
+            "CCP-8",
+            inverseRelations={"nodes": [{"type": "blocks", "issue": _closed()}]},
+            labels={"nodes": [{"name": "harness", "parent": None}]},
+        ),
+        _ready_issue(
+            "CCP-9",
+            relations={
+                "nodes": [{"type": "related", "relatedIssue": _open_issue("BRD")}]
+            },
+        ),
+        _ready_issue(
+            "CCP-10",
+            relations={"nodes": [{"type": "related", "relatedIssue": _closed("BRD")}]},
+        ),
+        _ready_issue(
+            "CCP-11", attachments={"nodes": [{"metadata": {"status": "merged"}}]}
+        ),
+    ]
+    post, sent = _serve([_connection(nodes, None, False)])
+    code, out, err, calls = _run(
+        ["issues", "ready", "--team", "CCP"], environ=_KEY, post=post
+    )
+    assert calls == []
+    assert (code, err) == (0, "")
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert [line["identifier"] for line in lines] == [
+        "CCP-2",
+        "CCP-8",
+        "CCP-10",
+        "CCP-1",
+    ]
+    assert list(lines[0]) == ["identifier", "title", "priority", "estimate", "url"]
+    body = sent[0]
+    assert body["variables"] == {"after": None, "teams": ["CCP"]}
+    query = body["query"]
+    assert isinstance(query, str)
+    assert 'state: { type: { eq: "unstarted" } }' in query
+    assert "assignee: { null: true }" in query
+    assert "estimate: { null: false }" in query
+
+
+def test_issues_ready_reports_graphql_errors() -> None:
+    post, _ = _serve([{"errors": [{"message": "bad filter"}], "data": None}])
+    code, out, err, _ = _run(
+        ["issues", "ready", "--team", "CCP"], environ=_KEY, post=post
+    )
+    assert code == 1
+    assert out == ""
+    assert "bad filter" in err
