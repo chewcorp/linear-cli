@@ -1745,12 +1745,13 @@ def _ready_issue(identifier: str, **overrides: object) -> dict[str, object]:
         "url": f"https://linear.app/chewcorp/issue/{identifier}",
         "description": "Task: x\nCriteria: y\nDone when: z",
         "delegate": None,
-        "labels": {"nodes": []},
-        "inverseRelations": {"nodes": []},
-        "relations": {"nodes": []},
-        "attachments": {"nodes": []},
     }
-    node.update(overrides)
+    for key in ("labels", "inverseRelations", "relations", "attachments"):
+        node[key] = {"nodes": [], "pageInfo": {"hasNextPage": False}}
+    for key, value in overrides.items():
+        if isinstance(value, dict) and "nodes" in value:
+            value = {"pageInfo": {"hasNextPage": False}, **value}
+        node[key] = value
     return node
 
 
@@ -1794,6 +1795,10 @@ def test_issues_ready_keeps_only_the_frontier() -> None:
         ),
         _ready_issue(
             "CCP-11", attachments={"nodes": [{"metadata": {"status": "merged"}}]}
+        ),
+        _ready_issue(
+            "CCP-12",
+            inverseRelations={"nodes": [], "pageInfo": {"hasNextPage": True}},
         ),
     ]
     post, sent = _serve([_connection(nodes, None, False)])

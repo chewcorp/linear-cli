@@ -943,7 +943,7 @@ def _issues_changed(
     return 0
 
 
-# shortcut: 20 relations/labels/attachments per issue, raise if a card has more
+# Links per issue; a card with more is left off the frontier, not half-checked.
 _READY_LINK_PAGE: Final[int] = 20
 # Russell's actions live on the BRD team; an open linked BRD card holds the work.
 _RUSSELL_TEAM: Final[str] = "BRD"
@@ -958,14 +958,20 @@ query IssuesReady($after: String, $teams: [String!]!) {{
     nodes {{
       identifier title priority estimate url description
       delegate {{ id }}
-      labels(first: {_READY_LINK_PAGE}) {{ nodes {{ name parent {{ name }} }} }}
+      labels(first: {_READY_LINK_PAGE}) {{
+        nodes {{ name parent {{ name }} }} pageInfo {{ hasNextPage }}
+      }}
       inverseRelations(first: {_READY_LINK_PAGE}) {{
         nodes {{ type issue {{ team {{ key }} completedAt canceledAt }} }}
+        pageInfo {{ hasNextPage }}
       }}
       relations(first: {_READY_LINK_PAGE}) {{
         nodes {{ type relatedIssue {{ team {{ key }} completedAt canceledAt }} }}
+        pageInfo {{ hasNextPage }}
       }}
-      attachments(first: {_READY_LINK_PAGE}) {{ nodes {{ metadata }} }}
+      attachments(first: {_READY_LINK_PAGE}) {{
+        nodes {{ metadata }} pageInfo {{ hasNextPage }}
+      }}
     }}
     pageInfo {{ hasNextPage endCursor }}
   }}
@@ -984,6 +990,9 @@ def _ready(node: JsonValue) -> bool:
     if not isinstance(description, str) or "done when" not in description.lower():
         return False
     if "russell's action" in description.lower():
+        return False
+    links = ("labels", "inverseRelations", "relations", "attachments")
+    if any(_at(node, (key, "pageInfo", "hasNextPage")) is not False for key in links):
         return False
     if any(
         _at(label, ("parent", "name")) == "agent"
