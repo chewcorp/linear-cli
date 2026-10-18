@@ -16,7 +16,7 @@ from http.client import IncompleteRead
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Final, Protocol, TextIO, TypeAlias
+from typing import Final, Protocol, TextIO, TypeAlias, assert_never
 from urllib.error import HTTPError, URLError
 
 JsonScalar: TypeAlias = None | bool | int | float | str
@@ -135,6 +135,77 @@ fragment TypeRef on __Type {
 }
 """
 
+# shortcut: one page of 50, paginate when a caller needs the rest.
+_SHORTCUT_PAGE_SIZE: Final[int] = 50
+
+_ISSUE_ID_QUERY: Final[str] = """
+query LinearCliIssueId($id: String!) {
+  issue(id: $id) {
+    id
+  }
+}
+"""
+
+_COMMENT_CREATE: Final[str] = """
+mutation LinearCliCommentCreate($issueId: String!, $body: String!) {
+  commentCreate(input: { issueId: $issueId, body: $body }) {
+    success
+    comment {
+      url
+    }
+  }
+}
+"""
+
+_ISSUE_GET_QUERY: Final[str] = f"""
+query LinearCliIssueGet(
+  $id: String!
+  $withComments: Boolean!
+  $since: DateTimeOrDuration
+) {{
+  issue(id: $id) {{
+    identifier
+    title
+    description
+    state {{ name }}
+    assignee {{ name displayName }}
+    priority
+    estimate
+    cycle {{ name number }}
+    labels(first: {_SHORTCUT_PAGE_SIZE}) {{ nodes {{ name }} }}
+    parent {{ identifier }}
+    url
+    updatedAt
+    comments(first: {_SHORTCUT_PAGE_SIZE}, filter: {{ createdAt: {{ gte: $since }} }})
+      @include(if: $withComments) {{
+      nodes {{ url createdAt body user {{ name displayName }} }}
+    }}
+  }}
+}}
+"""
+
+_MOVE_LOOKUP_QUERY: Final[str] = f"""
+query LinearCliMoveLookup($id: String!, $state: String!) {{
+  issue(id: $id) {{
+    id
+    state {{ name }}
+    team {{
+      states(first: {_SHORTCUT_PAGE_SIZE}, filter: {{ name: {{ eq: $state }} }}) {{
+        nodes {{ id name }}
+      }}
+    }}
+  }}
+}}
+"""
+
+_ISSUE_MOVE: Final[str] = """
+mutation LinearCliIssueMove($id: String!, $stateId: String!) {
+  issueUpdate(id: $id, input: { stateId: $stateId }) {
+    success
+  }
+}
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class PersonalApiKey:
@@ -204,7 +275,40 @@ class IssuesChanged:
     with_comments: bool
 
 
-Invocation: TypeAlias = FetchSchema | ExecuteOperation | IssuesChanged
+@dataclass(frozen=True, slots=True)
+class GetIssue:
+    issue: str
+    comments_since: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PostComment:
+    issue: str
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
+class MoveIssue:
+    issue: str
+    state: str
+
+
+Shortcut: TypeAlias = GetIssue | PostComment | MoveIssue
+
+Invocation: TypeAlias = FetchSchema | ExecuteOperation | IssuesChanged | Shortcut
+
+
+@dataclass(frozen=True, slots=True)
+class _IssueId:
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Move:
+    issue: _IssueId
+    state_id: str
+    old: str
+    new: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +342,12 @@ class LocalInputError(Exception):
 
 class RemoteFailure(Exception):
     pass
+
+
+class GraphQLErrors(RemoteFailure):
+    def __init__(self, response: GraphQLResponse) -> None:
+        super().__init__("GraphQL response contains errors")
+        self.response = response
 
 
 class _ParserExit(Exception):
@@ -321,6 +431,33 @@ def parse_invocation(
         action="store_true",
         help="include comments created since the same time",
     )
+    comment = commands.add_parser("comment", help="post a comment on an issue")
+    comment.add_argument(
+        "issue", metavar="ISSUE", help="issue identifier, e.g. CCP-123"
+    )
+    comment.add_argument(
+        "--body-file",
+        required=True,
+        metavar="PATH",
+        help="markdown file for the comment body, or - to read stdin",
+    )
+    issue = commands.add_parser("issue", help="read or move one issue")
+    issue_verbs = issue.add_subparsers(dest="issue_command", required=True)
+    get = issue_verbs.add_parser("get", help="print one issue as JSON")
+    get.add_argument("issue", metavar="ISSUE", help="issue identifier, e.g. CCP-123")
+    get.add_argument(
+        "--comments-since",
+        metavar="ISO",
+        help="include comments created at or after this ISO-8601 time",
+    )
+    move = issue_verbs.add_parser("move", help="move an issue to a workflow state")
+    move.add_argument("issue", metavar="ISSUE", help="issue identifier, e.g. CCP-123")
+    move.add_argument(
+        "--state",
+        required=True,
+        metavar="NAME",
+        help="exact workflow state name on the issue's team",
+    )
     namespace = parser.parse_args(list(argv))
     if namespace.command == "schema":
         return FetchSchema()
@@ -330,6 +467,12 @@ def parse_invocation(
             window=_window(namespace.since, namespace.state_file),
             with_comments=namespace.with_comments,
         )
+    if namespace.command == "comment":
+        return PostComment(namespace.issue, _body(namespace.body_file, stdin))
+    if namespace.command == "issue" and namespace.issue_command == "get":
+        return GetIssue(namespace.issue, _comments_since(namespace.comments_since))
+    if namespace.command == "issue":
+        return MoveIssue(namespace.issue, namespace.state)
     document = _document(namespace.document, stdin)
     if namespace.paginate:
         _require_after(document)
@@ -412,6 +555,12 @@ class GraphQLClient:
             current = GraphQLOperation(operation.document, variables)
         raise RemoteFailure(f"pagination stopped after {_MAX_PAGES} pages")
 
+    def data(self, operation: GraphQLOperation) -> JsonObject:
+        response = self.execute(operation)
+        if response.has_errors:
+            raise GraphQLErrors(response)
+        return _data(response)
+
 
 def main(
     argv: Sequence[str] | None = None,
@@ -464,6 +613,16 @@ def main(
             except LocalInputError as exc:
                 _write_line(stderr, str(exc))
                 return 2
+        case GetIssue() | PostComment() | MoveIssue() as shortcut:
+            try:
+                line = _shortcut(GraphQLClient(credential, post), shortcut)
+            except GraphQLErrors as exc:
+                return _report(stderr, exc.response)
+            except RemoteFailure as exc:
+                _write_line(stderr, str(exc))
+                return 1
+            stdout.write(f"{line}\n")
+            return 0
     try:
         client = GraphQLClient(credential, post)
         response = client.paginate(operation) if paginate else client.execute(operation)
@@ -762,6 +921,190 @@ def _issues_changed(
     return 0
 
 
+def _shortcut(client: GraphQLClient, command: Shortcut) -> str:
+    match command:
+        case GetIssue():
+            return _issue_json(command, client.data(_issue_get_operation(command)))
+        case PostComment(issue=issue, body=body):
+            issue_id = _issue_id(issue, client.data(_issue_id_operation(issue)))
+            return _comment_url(client.data(_comment_operation(issue_id, body)))
+        case MoveIssue():
+            move = _move(command, client.data(_move_lookup_operation(command)))
+            return _moved_line(move, client.data(_move_operation(move)))
+    assert_never(command)
+
+
+def _issue(identifier: str, data: JsonObject) -> JsonObject:
+    match data:
+        case {"issue": dict() as issue}:
+            return issue
+        case {"issue": None}:
+            raise RemoteFailure(f"unknown issue {identifier}")
+    raise RemoteFailure("issue lookup returned no issue field")
+
+
+def _issue_id_operation(identifier: str) -> GraphQLOperation:
+    return GraphQLOperation(_ISSUE_ID_QUERY, {"id": identifier})
+
+
+def _issue_id(identifier: str, data: JsonObject) -> _IssueId:
+    match _issue(identifier, data):
+        case {"id": str(value)} if value:
+            return _IssueId(value)
+    raise RemoteFailure("issue lookup returned no id")
+
+
+def _comment_operation(issue: _IssueId, body: str) -> GraphQLOperation:
+    return GraphQLOperation(_COMMENT_CREATE, {"issueId": issue.value, "body": body})
+
+
+def _comment_url(data: JsonObject) -> str:
+    match data:
+        case {"commentCreate": {"success": True, "comment": {"url": str(url)}}} if url:
+            return url
+        case {"commentCreate": {"success": False}}:
+            raise RemoteFailure("commentCreate returned success: false")
+    raise RemoteFailure("commentCreate returned no comment URL")
+
+
+def _issue_get_operation(command: GetIssue) -> GraphQLOperation:
+    return GraphQLOperation(
+        _ISSUE_GET_QUERY,
+        {
+            "id": command.issue,
+            "withComments": command.comments_since is not None,
+            "since": command.comments_since,
+        },
+    )
+
+
+def _issue_json(command: GetIssue, data: JsonObject) -> str:
+    issue = _issue(command.issue, data)
+    labels: list[str] = []
+    for label in _nodes(issue.get("labels")):
+        name = _at(label, ("name",))
+        if isinstance(name, str):
+            labels.append(name)
+    shown: JsonObject = {
+        "identifier": _required_string(issue, "identifier"),
+        "title": _required_string(issue, "title"),
+        "description": _text_or_none(issue.get("description")),
+        "state": _text_or_none(_at(issue, ("state", "name"))),
+        "assignee": _person(issue.get("assignee")),
+        "priority": _number(issue.get("priority")),
+        "estimate": _number(issue.get("estimate")),
+        "cycle": _cycle(issue.get("cycle")),
+        "labels": labels,
+        "parent": _text_or_none(_at(issue, ("parent", "identifier"))),
+        "url": _required_string(issue, "url"),
+        "updatedAt": _required_string(issue, "updatedAt"),
+    }
+    if command.comments_since is not None:
+        shown["comments"] = [_comment(node) for node in _nodes(issue.get("comments"))]
+    return json.dumps(shown, indent=2, ensure_ascii=False)
+
+
+def _required_string(node: JsonObject, key: str) -> str:
+    value = node.get(key)
+    if isinstance(value, str):
+        return value
+    raise RemoteFailure(f"issue lookup returned no {key}")
+
+
+def _text_or_none(value: JsonValue) -> str | None:
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _number(value: JsonValue) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return value
+
+
+def _nodes(value: JsonValue) -> list[JsonValue]:
+    match value:
+        case {"nodes": list(nodes)}:
+            return nodes
+    return []
+
+
+def _comment(node: JsonValue) -> JsonObject:
+    if not isinstance(node, dict):
+        raise RemoteFailure("issue comments returned an unexpected shape")
+    return {
+        "url": _text_or_none(node.get("url")),
+        "createdAt": _text_or_none(node.get("createdAt")),
+        "body": _text_or_none(node.get("body")),
+        "user": _person(node.get("user")),
+    }
+
+
+def _person(user: JsonValue) -> str | None:
+    match user:
+        case {"displayName": str(display)} if display:
+            return display
+        case {"name": str(name)} if name:
+            return name
+    return None
+
+
+def _cycle(cycle: JsonValue) -> str | None:
+    match cycle:
+        case {"name": str(name)} if name:
+            return name
+        case {"number": int(number)} if not isinstance(number, bool):
+            return str(number)
+        case {"number": float(number)} if number.is_integer():
+            return str(int(number))
+        case {"number": float(number)}:
+            return str(number)
+    return None
+
+
+def _move_lookup_operation(command: MoveIssue) -> GraphQLOperation:
+    return GraphQLOperation(
+        _MOVE_LOOKUP_QUERY, {"id": command.issue, "state": command.state}
+    )
+
+
+def _move(command: MoveIssue, data: JsonObject) -> _Move:
+    match _issue(command.issue, data):
+        case {
+            "id": str(issue_id),
+            "state": {"name": str(old)},
+            "team": {"states": {"nodes": list(states)}},
+        }:
+            pass
+        case _:
+            raise RemoteFailure("move lookup returned an unexpected shape")
+    match states:
+        case [{"id": str(state_id), "name": str(new)}]:
+            return _Move(_IssueId(issue_id), state_id, old, new)
+        case []:
+            raise RemoteFailure(f"unknown state {command.state!r} for {command.issue}")
+        case [_, _, *_]:
+            raise RemoteFailure(
+                f"ambiguous state {command.state!r} for {command.issue}: "
+                f"{len(states)} matches"
+            )
+    raise RemoteFailure("move lookup returned an unexpected shape")
+
+
+def _move_operation(move: _Move) -> GraphQLOperation:
+    return GraphQLOperation(
+        _ISSUE_MOVE, {"id": move.issue.value, "stateId": move.state_id}
+    )
+
+
+def _moved_line(move: _Move, data: JsonObject) -> str:
+    match data:
+        case {"issueUpdate": {"success": True}}:
+            return f"{move.old} → {move.new}"
+    raise RemoteFailure("issueUpdate returned success: false")
+
+
 def _report(stderr: TextIO, response: GraphQLResponse) -> int:
     if not response.has_errors:
         return 0
@@ -811,6 +1154,28 @@ def _variables(raw: str) -> JsonObject:
         raise LocalInputError("--variables must be a JSON object")
     _reject_nonfinite(value)
     return value
+
+
+def _body(path: str, stdin: TextIO) -> str:
+    try:
+        text = stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise LocalInputError(f"cannot read {path}: {exc.strerror}") from None
+    except UnicodeDecodeError:
+        raise LocalInputError(f"{path} is not UTF-8") from None
+    if not text.strip():
+        raise LocalInputError("comment body is empty")
+    return text
+
+
+def _comments_since(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    try:
+        datetime.fromisoformat(raw)
+    except ValueError:
+        raise LocalInputError("--comments-since must be an ISO-8601 time") from None
+    return raw
 
 
 def _authorization(credential: Credential) -> str:
