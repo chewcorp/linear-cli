@@ -1746,7 +1746,7 @@ def _ready_issue(identifier: str, **overrides: object) -> dict[str, object]:
         "description": "Task: x\nCriteria: y\nDone when: z",
         "delegate": None,
     }
-    for key in ("labels", "inverseRelations", "relations", "attachments"):
+    for key in ("labels", "inverseRelations", "attachments"):
         node[key] = {"nodes": [], "pageInfo": {"hasNextPage": False}}
     for key, value in overrides.items():
         if isinstance(value, dict) and "nodes" in value:
@@ -1759,8 +1759,17 @@ def _closed(team: str = "CCP") -> dict[str, object]:
     return {"team": {"key": team}, "completedAt": "2026-10-17T00:00:00Z"}
 
 
-def _open_issue(team: str = "CCP") -> dict[str, object]:
-    return {"team": {"key": team}, "completedAt": None, "canceledAt": None}
+def _open_issue(team: str = "CCP", state: str = "Todo") -> dict[str, object]:
+    return {
+        "team": {"key": team},
+        "state": {"name": state},
+        "completedAt": None,
+        "canceledAt": None,
+    }
+
+
+def _blocked_by(issue: dict[str, object]) -> dict[str, object]:
+    return {"nodes": [{"type": "blocks", "issue": issue}]}
 
 
 def test_issues_ready_keeps_only_the_frontier() -> None:
@@ -1785,13 +1794,10 @@ def test_issues_ready_keeps_only_the_frontier() -> None:
         ),
         _ready_issue(
             "CCP-9",
-            relations={
-                "nodes": [{"type": "related", "relatedIssue": _open_issue("BRD")}]
-            },
+            inverseRelations=_blocked_by(_open_issue("BRD", "Under Consideration")),
         ),
         _ready_issue(
-            "CCP-10",
-            relations={"nodes": [{"type": "related", "relatedIssue": _closed("BRD")}]},
+            "CCP-10", inverseRelations=_blocked_by(_open_issue("BRD", "Approved"))
         ),
         _ready_issue(
             "CCP-11", attachments={"nodes": [{"metadata": {"status": "merged"}}]}
@@ -1799,6 +1805,12 @@ def test_issues_ready_keeps_only_the_frontier() -> None:
         _ready_issue(
             "CCP-12",
             inverseRelations={"nodes": [], "pageInfo": {"hasNextPage": True}},
+        ),
+        _ready_issue(
+            "CCP-13",
+            inverseRelations={
+                "nodes": [{"type": "related", "issue": _open_issue("BRD")}]
+            },
         ),
     ]
     post, sent = _serve([_connection(nodes, None, False)])
@@ -1812,6 +1824,7 @@ def test_issues_ready_keeps_only_the_frontier() -> None:
         "CCP-2",
         "CCP-8",
         "CCP-10",
+        "CCP-13",
         "CCP-1",
     ]
     assert list(lines[0]) == ["identifier", "title", "priority", "estimate", "url"]
