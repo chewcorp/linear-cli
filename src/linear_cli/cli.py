@@ -157,11 +157,7 @@ mutation LinearCliCommentCreate($issueId: String!, $body: String!) {
 """
 
 _ISSUE_GET_QUERY: Final[str] = f"""
-query LinearCliIssueGet(
-  $id: String!
-  $withComments: Boolean!
-  $since: DateTimeOrDuration
-) {{
+query LinearCliIssueGet($id: String!) {{
   issue(id: $id) {{
     identifier
     title
@@ -175,10 +171,6 @@ query LinearCliIssueGet(
     parent {{ identifier }}
     url
     updatedAt
-    comments(first: {_SHORTCUT_PAGE_SIZE}, filter: {{ createdAt: {{ gte: $since }} }})
-      @include(if: $withComments) {{
-      nodes {{ url createdAt body user {{ name displayName }} }}
-    }}
   }}
 }}
 """
@@ -909,9 +901,9 @@ def _identifier(node: JsonValue) -> str:
 
 
 def _all_comments(
-    client: GraphQLClient, identifier: str, since: datetime
+    client: GraphQLClient, operation: GraphQLOperation
 ) -> list[JsonValue]:
-    response = client.paginate(_issue_comments_operation(identifier, since))
+    response = client.paginate(operation)
     if response.has_errors:
         raise GraphQLErrors(response)
     page = _read_page(_data(response), ("issue", "comments"))
@@ -926,7 +918,11 @@ def _node_with_comments(
     if not isinstance(node, dict):
         raise RemoteFailure("issue node was not an object")
     copied = dict(node)
-    copied["comments"] = {"nodes": _all_comments(client, _identifier(node), since)}
+    copied["comments"] = {
+        "nodes": _all_comments(
+            client, _issue_comments_operation(_identifier(node), since)
+        )
+    }
     return copied
 
 
@@ -1094,7 +1090,9 @@ def _issues_ready(client: GraphQLClient, teams: tuple[str, ...], stdout: TextIO)
 def _shortcut(client: GraphQLClient, command: Shortcut) -> str:
     match command:
         case GetIssue():
-            return _issue_json(command, client.data(_issue_get_operation(command)))
+            return _issue_json(
+                client, command, client.data(_issue_get_operation(command))
+            )
         case PostComment(issue=issue, body=body):
             issue_id = _issue_id(issue, client.data(_issue_id_operation(issue)))
             return _comment_url(client.data(_comment_operation(issue_id, body)))
@@ -1138,17 +1136,23 @@ def _comment_url(data: JsonObject) -> str:
 
 
 def _issue_get_operation(command: GetIssue) -> GraphQLOperation:
-    return GraphQLOperation(
-        _ISSUE_GET_QUERY,
-        {
-            "id": command.issue,
-            "withComments": command.comments_since is not None,
-            "since": command.comments_since,
-        },
+    return GraphQLOperation(_ISSUE_GET_QUERY, {"id": command.issue})
+
+
+def _issue_get_comments_operation(issue: str, since: str) -> GraphQLOperation:
+    document = (
+        "query IssueGetComments($id: String!, $after: String, "
+        "$since: DateTimeOrDuration!) { "
+        "issue(id: $id) { "
+        f"comments(first: {_COMMENT_PAGE_SIZE}, after: $after, "
+        "filter: {createdAt: {gte: $since}}) { "
+        "nodes { url createdAt body user { name displayName } } "
+        "pageInfo { hasNextPage endCursor } } } }"
     )
+    return GraphQLOperation(document, {"id": issue, "after": None, "since": since})
 
 
-def _issue_json(command: GetIssue, data: JsonObject) -> str:
+def _issue_json(client: GraphQLClient, command: GetIssue, data: JsonObject) -> str:
     issue = _issue(command.issue, data)
     labels: list[str] = []
     for label in _nodes(issue.get("labels")):
@@ -1170,8 +1174,14 @@ def _issue_json(command: GetIssue, data: JsonObject) -> str:
         "updatedAt": _required_string(issue, "updatedAt"),
     }
     if command.comments_since is not None:
-        shown["comments"] = [_comment(node) for node in _nodes(issue.get("comments"))]
-    return json.dumps(shown, indent=2, ensure_ascii=False)
+        shown["comments"] = [
+            _comment(node)
+            for node in _all_comments(
+                client,
+                _issue_get_comments_operation(command.issue, command.comments_since),
+            )
+        ]
+    return json.dumps(shown, ensure_ascii=False, separators=(",", ":"))
 
 
 def _required_string(node: JsonObject, key: str) -> str:
