@@ -1562,18 +1562,13 @@ def test_issue_get_prints_one_flat_object() -> None:
         "updatedAt": "2026-10-16T12:00:00.000Z",
     }
     assert (code, err, calls) == (0, "", [])
-    assert out == json.dumps(expected, indent=2, ensure_ascii=False) + "\n"
+    assert out == json.dumps(expected, ensure_ascii=False, separators=(",", ":")) + "\n"
     assert "comments" not in json.loads(out)
-    assert _posted(sent) == [
-        (
-            "LinearCliIssueGet",
-            {"id": "CCP-123", "withComments": False, "since": None},
-        )
-    ]
+    assert _posted(sent) == [("LinearCliIssueGet", {"id": "CCP-123"})]
     query = sent[0]["query"]
     assert isinstance(query, str)
     assert "labels(first: 50)" in query
-    assert "comments(first: 50, filter: { createdAt: { gte: $since } })" in query
+    assert "comments(" not in query
 
 
 def test_issue_get_prints_one_compact_line() -> None:
@@ -1686,38 +1681,38 @@ def test_issue_get_nulls_absent_fields() -> None:
         "updatedAt": "2026-10-16T12:00:00.000Z",
     }
     assert (code, err, calls) == (0, "", [])
-    assert out == json.dumps(expected, indent=2, ensure_ascii=False) + "\n"
+    assert out == json.dumps(expected, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
 def test_issue_get_comments_since() -> None:
     since = "2026-10-16T00:00:00Z"
     post, sent = _serve(
         [
-            _shown_issue(
-                assignee={"name": "ada", "displayName": "Ada"},
-                comments={
-                    "nodes": [
-                        {
-                            "url": "https://linear.app/comment/b",
-                            "createdAt": "2026-10-16T02:00:00.000Z",
-                            "body": "second",
-                            "user": {"name": "ada", "displayName": "Ada"},
-                        },
-                        {
-                            "url": "https://linear.app/comment/a",
-                            "createdAt": "2026-10-16T01:00:00.000Z",
-                            "body": "first",
-                            "user": {"name": "grace", "displayName": ""},
-                        },
-                        {
-                            "url": "https://linear.app/comment/c",
-                            "createdAt": "2026-10-16T03:00:00.000Z",
-                            "body": "third",
-                            "user": {"name": "", "displayName": ""},
-                        },
-                    ]
-                },
-            )
+            _shown_issue(assignee={"name": "ada", "displayName": "Ada"}),
+            _comment_connection(
+                [
+                    {
+                        "url": "https://linear.app/comment/b",
+                        "createdAt": "2026-10-16T02:00:00.000Z",
+                        "body": "second",
+                        "user": {"name": "ada", "displayName": "Ada"},
+                    },
+                    {
+                        "url": "https://linear.app/comment/a",
+                        "createdAt": "2026-10-16T01:00:00.000Z",
+                        "body": "first",
+                        "user": {"name": "grace", "displayName": ""},
+                    },
+                    {
+                        "url": "https://linear.app/comment/c",
+                        "createdAt": "2026-10-16T03:00:00.000Z",
+                        "body": "third",
+                        "user": {"name": "", "displayName": ""},
+                    },
+                ],
+                None,
+                False,
+            ),
         ]
     )
     code, out, err, calls = _run(
@@ -1749,19 +1744,21 @@ def test_issue_get_comments_since() -> None:
         },
     ]
     assert _posted(sent) == [
+        ("LinearCliIssueGet", {"id": "CCP-123"}),
         (
-            "LinearCliIssueGet",
-            {"id": "CCP-123", "withComments": True, "since": since},
-        )
+            "IssueGetComments",
+            {"id": "CCP-123", "after": None, "since": since},
+        ),
     ]
-    query = sent[0]["query"]
+    query = sent[1]["query"]
     assert isinstance(query, str)
-    assert "createdAt: { gte: $since }" in query
+    assert "gte: $since" in query
+    assert "gt: $since" not in query
 
 
 def test_issue_get_accepts_a_naive_since() -> None:
     raw = "2026-10-16T00:00:00"
-    post, sent = _serve([_shown_issue(comments={"nodes": []})])
+    post, sent = _serve([_shown_issue(), _comment_connection([], None, False)])
     code, out, err, calls = _run(
         ["issue", "get", "CCP-123", "--comments-since", raw],
         environ=_KEY,
@@ -1770,12 +1767,8 @@ def test_issue_get_accepts_a_naive_since() -> None:
     assert code == 0
     assert err == ""
     assert calls == []
-    assert "comments" in json.loads(out)
-    assert sent[0]["variables"] == {
-        "id": "CCP-123",
-        "withComments": True,
-        "since": raw,
-    }
+    assert json.loads(out)["comments"] == []
+    assert sent[1]["variables"] == {"id": "CCP-123", "after": None, "since": raw}
 
 
 def test_issue_get_rejects_unparseable_since() -> None:
