@@ -1117,19 +1117,56 @@ def test_issues_changed_rejects_a_bad_state_file(tmp_path: Path) -> None:
     assert "empty" in err
 
 
-def test_issues_changed_includes_comments_since_the_watermark() -> None:
-    body = "x" * 300
-    node = _issue(
-        "CCP-9",
-        comments=[
-            {
-                "body": body,
-                "createdAt": "2026-10-17T12:30:00.000Z",
-                "user": {"displayName": "Ada"},
+def _comment_connection(
+    nodes: list[dict[str, object]], cursor: str | None, has_next: bool
+) -> dict[str, object]:
+    return {
+        "data": {
+            "issue": {
+                "comments": {
+                    "nodes": nodes,
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                }
             }
-        ],
-    )
-    post, sent = _serve([_connection([node], None, False)])
+        }
+    }
+
+
+def _reply(payload: dict[str, object]) -> _HttpReply:
+    return _HttpReply(200, "OK", json.dumps(payload).encode())
+
+
+def test_issues_changed_includes_comments_since_the_watermark() -> None:
+    sent: list[dict[str, object]] = []
+
+    def post(
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        timeout_seconds: float,
+    ) -> _HttpReply:
+        del url, headers, timeout_seconds
+        parsed = json.loads(body)
+        sent.append(parsed)
+        variables = parsed["variables"]
+        assert isinstance(variables, dict)
+        if "teams" in variables:
+            return _reply(_connection([_issue("CCP-9")], None, False))
+        return _reply(
+            _comment_connection(
+                [
+                    {
+                        "body": "x" * 300,
+                        "createdAt": "2026-10-17T12:30:00.000Z",
+                        "user": {"displayName": "Ada"},
+                    }
+                ],
+                None,
+                False,
+            )
+        )
+
     code, out, err, calls = _run(
         [
             "issues",
@@ -1154,11 +1191,142 @@ def test_issues_changed_includes_comments_since_the_watermark() -> None:
             "body": "x" * 280,
         }
     ]
-    query = sent[0]["query"]
-    assert isinstance(query, str)
-    assert "comments(" in query
-    assert "createdAt: {gt: $since}" in query
-    assert sent[0]["variables"]["since"] == "2026-10-17T09:00:00.000Z"
+    assert sent[1]["variables"]["id"] == "CCP-9"
+    assert sent[1]["variables"]["since"] == "2026-10-17T09:00:00.000Z"
+
+
+def test_with_comments_returns_every_comment_page(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    original = "2026-10-17T09:00:00.000Z\n"
+    state.write_text(original)
+    sent: list[dict[str, object]] = []
+
+    def post(
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        timeout_seconds: float,
+    ) -> _HttpReply:
+        del url, headers, timeout_seconds
+        parsed = json.loads(body)
+        sent.append(parsed)
+        variables = parsed["variables"]
+        assert isinstance(variables, dict)
+        if "teams" in variables:
+            return _reply(_connection([_issue("CCP-51")], None, False))
+        after = variables.get("after")
+        if after is None:
+            nodes = [
+                {
+                    "body": f"c{index}",
+                    "createdAt": "2026-10-17T12:00:00.000Z",
+                    "user": {"displayName": "Ada"},
+                }
+                for index in range(50)
+            ]
+            return _reply(_comment_connection(nodes, "c1", True))
+        assert after == "c1"
+        return _reply(
+            _comment_connection(
+                [
+                    {
+                        "body": "c50",
+                        "createdAt": "2026-10-17T12:00:00.000Z",
+                        "user": {"displayName": "Ada"},
+                    }
+                ],
+                "c2",
+                False,
+            )
+        )
+
+    before = datetime.now(UTC)
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--with-comments",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    after = datetime.now(UTC)
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    line = json.loads(out)
+    assert [comment["body"] for comment in line["comments"]] == [
+        f"c{index}" for index in range(51)
+    ]
+    assert line["updatedAt"] == "2026-10-17T12:00:00.000Z"
+    stored = datetime.fromisoformat(state.read_text().strip())
+    assert before - timedelta(milliseconds=5) <= stored <= after
+    assert state.read_text() != original
+    comment_requests = [body for body in sent if "teams" not in body["variables"]]
+    assert [body["variables"]["after"] for body in comment_requests] == [None, "c1"]
+    assert {body["variables"]["since"] for body in comment_requests} == {
+        original.strip()
+    }
+    assert {body["variables"]["id"] for body in comment_requests} == {"CCP-51"}
+
+
+def test_comment_page_failure_leaves_the_state_file(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    original = "2026-10-17T09:00:00.000Z\n"
+    state.write_text(original)
+
+    def post(
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        timeout_seconds: float,
+    ) -> _HttpReply:
+        del url, headers, timeout_seconds
+        parsed = json.loads(body)
+        variables = parsed["variables"]
+        assert isinstance(variables, dict)
+        if "teams" in variables:
+            return _reply(_connection([_issue("CCP-51")], None, False))
+        if variables.get("after") is None:
+            return _reply(
+                _comment_connection(
+                    [
+                        {
+                            "body": "c0",
+                            "createdAt": "2026-10-17T12:00:00.000Z",
+                            "user": {"displayName": "Ada"},
+                        }
+                    ],
+                    "c1",
+                    True,
+                )
+            )
+        return _reply({"errors": [{"message": "comment page failed"}]})
+
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--with-comments",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 1
+    assert out == ""
+    assert "comment page failed" in err
+    assert state.read_text() == original
 
 
 def _posted(sent: list[dict[str, object]]) -> list[tuple[str, object]]:
