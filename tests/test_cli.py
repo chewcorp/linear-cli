@@ -1576,6 +1576,82 @@ def test_issue_get_prints_one_flat_object() -> None:
     assert "comments(first: 50, filter: { createdAt: { gte: $since } })" in query
 
 
+def test_issue_get_prints_one_compact_line() -> None:
+    post, _sent = _serve([_shown_issue()])
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, err, calls) == (0, "", [])
+    assert out.endswith("\n")
+    assert "\n" not in out[:-1]
+    loaded = json.loads(out)
+    assert loaded["identifier"] == "CCP-123"
+    assert loaded["title"] == "Write the shortcuts"
+    assert "comments" not in loaded
+    assert out == json.dumps(loaded, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def test_issue_get_comments_since_returns_every_page() -> None:
+    def comment(index: int) -> dict[str, object]:
+        return {
+            "url": f"https://linear.app/comment/{index}",
+            "createdAt": "2026-10-16T00:00:00.000Z",
+            "body": f"c{index}",
+            "user": {"name": "ada", "displayName": "Ada"},
+        }
+
+    post, _sent = _serve(
+        [
+            _shown_issue(),
+            _comment_connection([comment(index) for index in range(50)], "c1", True),
+            _comment_connection([comment(50)], "c2", False),
+        ]
+    )
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123", "--comments-since", "2026-10-16T00:00:00Z"],
+        environ=_KEY,
+        post=post,
+    )
+    assert (code, err, calls) == (0, "", [])
+    assert out.endswith("\n") and "\n" not in out[:-1]
+    loaded = json.loads(out)
+    assert [item["body"] for item in loaded["comments"]] == [
+        f"c{index}" for index in range(51)
+    ]
+
+
+def test_issue_get_comment_page_failure_prints_nothing() -> None:
+    post, _sent = _serve(
+        [
+            _shown_issue(),
+            _comment_connection(
+                [
+                    {
+                        "url": "https://linear.app/comment/0",
+                        "createdAt": "2026-10-16T00:00:00.000Z",
+                        "body": "c0",
+                        "user": {"name": "ada", "displayName": "Ada"},
+                    }
+                ],
+                "c1",
+                True,
+            ),
+            {"errors": [{"message": "comment page failed"}]},
+        ]
+    )
+    code, out, err, calls = _run(
+        ["issue", "get", "CCP-123", "--comments-since", "2026-10-16T00:00:00Z"],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code != 0
+    assert out == ""
+    assert "comment page failed" in err
+
+
 def test_issue_get_nulls_absent_fields() -> None:
     post, _sent = _serve(
         [
