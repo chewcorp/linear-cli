@@ -28,7 +28,6 @@ HTTP_TIMEOUT_SECONDS: Final[float] = 30.0
 _API_KEY_ENV: Final[str] = "LINEAR_API_KEY"
 _OAUTH_ENV: Final[str] = "LINEAR_OAUTH_TOKEN"
 _ISSUE_PAGE_SIZE: Final[int] = 50
-# shortcut: 50 comments per issue, raise this if a wake needs more
 _COMMENT_PAGE_SIZE: Final[int] = 50
 _COMMENT_BODY_LIMIT: Final[int] = 280
 # shortcut: 500 pages, raise this if a real walk is longer
@@ -813,17 +812,9 @@ def _selection(fields: tuple[tuple[str, tuple[str, ...]], ...]) -> str:
 def _issues_changed_operation(
     teams: tuple[str, ...],
     since: datetime,
-    with_comments: bool,
     *,
     until: datetime | None = None,
 ) -> GraphQLOperation:
-    comments = ""
-    if with_comments:
-        comments = (
-            " comments(first: "
-            f"{_COMMENT_PAGE_SIZE}, filter: {{createdAt: {{gt: $since}}}}) "
-            f"{{ nodes {{ {_selection(_COMMENT_FIELDS)} }} }}"
-        )
     updated = "gt: $since"
     declared = "$after: String, $since: DateTimeOrDuration!"
     variables: JsonObject = {
@@ -841,10 +832,26 @@ def _issues_changed_operation(
         f"query IssuesChanged({declared}, $teams: [String!]!) {{ "
         f"issues(first: {_ISSUE_PAGE_SIZE}, after: $after, orderBy: updatedAt, "
         f"filter: {{updatedAt: {{{updated}}}, team: {{key: {{in: $teams}}}}}}) {{ "
-        f"nodes {{ {_selection(_ISSUE_FIELDS)}{comments} }} "
+        f"nodes {{ {_selection(_ISSUE_FIELDS)} }} "
         "pageInfo { hasNextPage endCursor } } }"
     )
     return GraphQLOperation(document, variables)
+
+
+def _issue_comments_operation(identifier: str, since: datetime) -> GraphQLOperation:
+    document = (
+        "query IssueComments($id: String!, $after: String, "
+        "$since: DateTimeOrDuration!) { "
+        "issue(id: $id) { "
+        f"comments(first: {_COMMENT_PAGE_SIZE}, after: $after, "
+        "filter: {createdAt: {gt: $since}}) { "
+        f"nodes {{ {_selection(_COMMENT_FIELDS)} }} "
+        "pageInfo { hasNextPage endCursor } } } }"
+    )
+    return GraphQLOperation(
+        document,
+        {"id": identifier, "after": None, "since": _iso(since)},
+    )
 
 
 def _at(node: JsonValue, path: tuple[str, ...]) -> JsonValue:
@@ -892,6 +899,37 @@ def _issue_line(node: JsonValue, with_comments: bool) -> str:
     return json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
 
 
+def _identifier(node: JsonValue) -> str:
+    if not isinstance(node, dict):
+        raise RemoteFailure("issue node was not an object")
+    identifier = node.get("identifier")
+    if not isinstance(identifier, str) or identifier == "":
+        raise RemoteFailure("issue identifier was missing")
+    return identifier
+
+
+def _all_comments(
+    client: GraphQLClient, identifier: str, since: datetime
+) -> list[JsonValue]:
+    response = client.paginate(_issue_comments_operation(identifier, since))
+    if response.has_errors:
+        raise GraphQLErrors(response)
+    page = _read_page(_data(response), ("issue", "comments"))
+    if page.has_next_page:
+        raise RemoteFailure("comment page was not complete")
+    return list(page.nodes)
+
+
+def _node_with_comments(
+    client: GraphQLClient, node: JsonValue, since: datetime
+) -> JsonValue:
+    if not isinstance(node, dict):
+        raise RemoteFailure("issue node was not an object")
+    copied = dict(node)
+    copied["comments"] = {"nodes": _all_comments(client, _identifier(node), since)}
+    return copied
+
+
 def _write_watermark(path: Path, at: datetime) -> None:
     fd, name = tempfile.mkstemp(prefix=".linear-wake-", dir=path.parent)
     try:
@@ -928,14 +966,20 @@ def _issues_changed(
         _issues_changed_operation(
             command.teams,
             at,
-            command.with_comments,
             until=now if state_file is not None else None,
         )
     )
     if response.has_errors:
         return _report(stderr, response)
     page = _read_page(_data(response), ("issues",))
-    lines = [_issue_line(node, command.with_comments) for node in page.nodes]
+    try:
+        nodes = [
+            _node_with_comments(client, node, at) if command.with_comments else node
+            for node in page.nodes
+        ]
+    except GraphQLErrors as exc:
+        return _report(stderr, exc.response)
+    lines = [_issue_line(node, command.with_comments) for node in nodes]
     if lines:
         stdout.write("\n".join(lines) + "\n")
     if state_file is not None:
