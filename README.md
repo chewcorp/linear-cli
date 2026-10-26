@@ -70,6 +70,10 @@ Add `--with-comments` to include comments created in that same window.
 uv sync --group dev
 ```
 
+For API-dependent development without a Linear account or network access, use
+the [local Linear sandbox](docs/local-services.md). It provides a real HTTP
+GraphQL endpoint with synthetic, resettable data. No Docker or database is needed.
+
 ## Checks
 
 ```bash
