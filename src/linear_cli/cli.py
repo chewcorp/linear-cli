@@ -18,6 +18,7 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Final, Protocol, TextIO, TypeAlias, assert_never
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 
 JsonScalar: TypeAlias = None | bool | int | float | str
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -364,6 +365,31 @@ def credential_from_env(environ: Mapping[str, str]) -> Credential:
     raise LocalInputError(f"set exactly one of {_API_KEY_ENV} or {_OAUTH_ENV}")
 
 
+def graphql_url_from_env(environ: Mapping[str, str]) -> str:
+    url = environ.get("LINEAR_GRAPHQL_URL", LINEAR_GRAPHQL_URL)
+    if url == LINEAR_GRAPHQL_URL:
+        return url
+    try:
+        parsed = urlsplit(url)
+        valid = (
+            not any(char.isspace() for char in url)
+            and parsed.scheme in {"http", "https"}
+            and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+            and parsed.username is None
+            and parsed.password is None
+            and not parsed.fragment
+            and (parsed.port is None or parsed.port > 0)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise LocalInputError(
+            "LINEAR_GRAPHQL_URL must be the Linear endpoint or an HTTP(S) URL "
+            "on localhost, 127.0.0.1, or ::1"
+        )
+    return url
+
+
 def parse_invocation(
     argv: Sequence[str],
     stdin: TextIO,
@@ -376,6 +402,7 @@ def parse_invocation(
     parser = _bind_parser(stdout, stderr)(
         prog="linear-cli",
         description="Use Linear through its published GraphQL schema.",
+        epilog="Set LINEAR_GRAPHQL_URL to a loopback URL for local API development.",
     )
     parser.add_argument(
         "--version",
@@ -493,6 +520,7 @@ def parse_invocation(
 class GraphQLClient:
     credential: Credential
     post: _HttpPost
+    url: str = LINEAR_GRAPHQL_URL
 
     def execute(self, operation: GraphQLOperation) -> GraphQLResponse:
         secret = self.credential.value
@@ -507,7 +535,7 @@ class GraphQLClient:
             raise LocalInputError("--variables must be a JSON object") from None
         try:
             reply = self.post(
-                url=LINEAR_GRAPHQL_URL,
+                url=self.url,
                 headers={
                     "Content-Type": "application/json",
                     "Accept": "application/json",
@@ -591,6 +619,7 @@ def main(
         return 2
     try:
         credential = credential_from_env(environ)
+        client = GraphQLClient(credential, post, graphql_url_from_env(environ))
     except LocalInputError as exc:
         _write_line(stderr, str(exc))
         return 2
@@ -609,7 +638,7 @@ def main(
             pass
         case IssuesReady(teams=teams):
             try:
-                return _issues_ready(GraphQLClient(credential, post), teams, stdout)
+                return _issues_ready(client, teams, stdout)
             except GraphQLErrors as exc:
                 return _report(stderr, exc.response)
             except RemoteFailure as exc:
@@ -617,9 +646,7 @@ def main(
                 return 1
         case IssuesChanged() as command:
             try:
-                return _issues_changed(
-                    GraphQLClient(credential, post), command, stdout, stderr
-                )
+                return _issues_changed(client, command, stdout, stderr)
             except (RemoteFailure, OSError) as exc:
                 _write_line(stderr, str(exc))
                 return 1
@@ -628,7 +655,7 @@ def main(
                 return 2
         case GetIssue() | PostComment() | MoveIssue() as shortcut:
             try:
-                line = _shortcut(GraphQLClient(credential, post), shortcut)
+                line = _shortcut(client, shortcut)
             except GraphQLErrors as exc:
                 return _report(stderr, exc.response)
             except RemoteFailure as exc:
@@ -637,7 +664,6 @@ def main(
             stdout.write(f"{line}\n")
             return 0
     try:
-        client = GraphQLClient(credential, post)
         response = client.paginate(operation) if paginate else client.execute(operation)
     except RemoteFailure as exc:
         _write_line(stderr, str(exc))

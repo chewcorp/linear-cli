@@ -207,6 +207,55 @@ def test_personal_key_query() -> None:
     assert call["body"] == VIEWER_BODY
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8765/graphql",
+        "http://localhost:8765/graphql",
+        "http://[::1]:8765/graphql",
+        "https://localhost/graphql",
+    ],
+)
+def test_local_graphql_endpoint(url: str) -> None:
+    code, out, err, calls = _run(
+        ["graphql", VIEWER_QUERY],
+        environ={"LINEAR_API_KEY": "local-dev-key", "LINEAR_GRAPHQL_URL": url},
+        reply=_HttpReply(200, "OK", b'{"data":{"viewer":{"id":"u1"}}}'),
+    )
+    assert (code, out, err) == (0, VIEWER_STDOUT, "")
+    assert calls[0]["url"] == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "not-a-url",
+        "https://example.com/graphql",
+        "http://api.linear.app/graphql",
+        "file:///tmp/graphql",
+        "http://127.0.0.1:bad/graphql",
+        "http://127.0.0.1:99999/graphql",
+        "http://127.0.0.1:0/graphql",
+        "http://[::1/graphql",
+        "http://local-dev-key@localhost/graphql",
+        "http://localhost/graphql#fragment",
+        " http://localhost/graphql",
+        "http://localhost/\n",
+    ],
+)
+def test_invalid_graphql_endpoint_fails_before_http(url: str) -> None:
+    code, out, err, calls = _run(
+        ["schema"],
+        environ={"LINEAR_API_KEY": "local-dev-key", "LINEAR_GRAPHQL_URL": url},
+    )
+    assert code == 2
+    assert out == ""
+    assert "LINEAR_GRAPHQL_URL must be" in err
+    assert "local-dev-key" not in err
+    assert calls == []
+
+
 def test_oauth_token_query() -> None:
     code, out, err, calls = _run(
         ["graphql", VIEWER_QUERY],
