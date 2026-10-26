@@ -55,7 +55,10 @@ need cleanup. Normal CLI invocations still default to
 `https://api.linear.app/graphql`. `LINEAR_GRAPHQL_URL` accepts that endpoint or
 HTTP(S) URLs on `localhost`, `127.0.0.1`, or `::1`, and rejects other hosts,
 embedded credentials, and fragments before making a request. Keep dummy
-credentials scoped to the local endpoint.
+credentials scoped to the local endpoint. The CLI sends whatever credential is
+configured to whatever endpoint is configured, and a host check cannot tell the
+sandbox from another local service, so unset real Linear tokens before
+overriding the endpoint, as the disposable shell above does.
 
 ## Scope and automated checks
 
@@ -64,7 +67,9 @@ schema. It supports introspection, `viewer`, `issue get` (without
 `--comments-since`), `comment`, `issue move`, and GraphQL queries using the
 fields declared in `tests/mock_linear.py`. There is one issue, `LOCAL-1`
 (internal ID `local-issue`), and three states: `Todo`, `In Review`, and `Done`.
-Mutations persist until the server restarts.
+Mutations persist until the server restarts, and each successful mutation
+advances the issue's `updatedAt` by one second from `2026-01-01T00:00:00Z`, so
+update-time behavior is deterministic.
 
 `issues changed`, `issues ready`, pagination, comment time filters, and other
 Linear APIs are not implemented. Unsupported fields fail GraphQL validation

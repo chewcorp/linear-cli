@@ -1,7 +1,9 @@
 """Loopback-only Linear sandbox. Run with: uv run python tests/mock_linear.py."""
 
 import argparse
+import itertools
 import json
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from graphql import GraphQLError, build_schema, graphql_sync
@@ -51,6 +53,23 @@ def create_server(port: int = 8765) -> HTTPServer:
         {"id": "done", "name": "Done"},
     ]
     comments: list[dict] = []
+    # Deterministic clock: every successful mutation advances updatedAt a second.
+    mutations = itertools.count(1)
+
+    def next_updated_at() -> str:
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        stamp = base + timedelta(seconds=next(mutations))
+        return stamp.isoformat().replace("+00:00", "Z")
+
+    def team_states(info, first=None, filter=None):
+        # An omitted, empty, or null name comparator imposes no constraint.
+        comparator = filter.get("name") if isinstance(filter, dict) else None
+        eq = comparator.get("eq") if isinstance(comparator, dict) else None
+        if first is not None and first < 0:
+            raise GraphQLError("first must be non-negative")
+        matched = [state for state in states if eq is None or state["name"] == eq]
+        return {"nodes": matched[:first]}
+
     issue = {
         "id": "local-issue",
         "identifier": "LOCAL-1",
@@ -62,15 +81,7 @@ def create_server(port: int = 8765) -> HTTPServer:
         "labels": {"nodes": [{"name": "sandbox"}]},
         "url": "https://linear.example/issue/LOCAL-1",
         "updatedAt": "2026-01-01T00:00:00Z",
-        "team": {
-            "states": lambda info, first=None, filter=None: {
-                "nodes": [
-                    state
-                    for state in states
-                    if not filter or state["name"] == filter.get("name", {}).get("eq")
-                ][:first]
-            }
-        },
+        "team": {"states": team_states},
         "comments": {"nodes": comments},
     }
 
@@ -86,6 +97,7 @@ def create_server(port: int = 8765) -> HTTPServer:
             "user": user,
         }
         comments.append(comment)
+        issue["updatedAt"] = next_updated_at()
         return {"success": True, "comment": comment}
 
     def issue_update(info, id, input):
@@ -93,6 +105,7 @@ def create_server(port: int = 8765) -> HTTPServer:
         if find_issue(info, id) is None or state is None:
             raise GraphQLError("Unknown issue or state")
         issue["state"] = state
+        issue["updatedAt"] = next_updated_at()
         return {"success": True}
 
     root = {

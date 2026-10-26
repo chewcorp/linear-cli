@@ -24,7 +24,13 @@ def sandbox(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
             thread.join(timeout=5)
 
 
-def run_cli(url: str, *args: str, stdin: str = "", oauth: bool = False):
+def run_cli(
+    url: str,
+    *args: str,
+    stdin: str = "",
+    oauth: bool = False,
+    token: str | None = None,
+):
     env = {
         k: v
         for k, v in os.environ.items()
@@ -32,7 +38,9 @@ def run_cli(url: str, *args: str, stdin: str = "", oauth: bool = False):
     }
     env["LINEAR_GRAPHQL_URL"] = url
     env["LINEAR_OAUTH_TOKEN" if oauth else "LINEAR_API_KEY"] = (
-        "local-dev-token" if oauth else "local-dev-key"
+        token
+        if token is not None
+        else ("local-dev-token" if oauth else "local-dev-key")
     )
     return subprocess.run(
         [sys.executable, "-m", "linear_cli", *args],
@@ -64,6 +72,15 @@ def test_sandbox_schema_and_auth_modes(sandbox: str) -> None:
         }
 
 
+def test_sandbox_rejects_wrong_credentials(sandbox: str) -> None:
+    for oauth in (False, True):
+        result = run_cli(
+            sandbox, "graphql", "{ viewer { id } }", oauth=oauth, token="wrong-token"
+        )
+        assert result.returncode == 1
+        assert "Use sandbox credentials" in result.stderr
+
+
 def test_sandbox_issue_mutations_persist(sandbox: str) -> None:
     result = run_cli(sandbox, "issue", "get", "LOCAL-1")
     assert result.returncode == 0, result.stderr
@@ -78,6 +95,9 @@ def test_sandbox_issue_mutations_persist(sandbox: str) -> None:
         "Todo → In Review\n",
         "",
     )
+    result = run_cli(sandbox, "issue", "get", "LOCAL-1")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["updatedAt"] == "2026-01-01T00:00:01Z"
     result = run_cli(
         sandbox, "comment", "LOCAL-1", "--body-file", "-", stdin="Local QA comment\n"
     )
@@ -89,11 +109,12 @@ def test_sandbox_issue_mutations_persist(sandbox: str) -> None:
         "--variables",
         '{"id":"LOCAL-1"}',
         "query($id: String!) { issue(id: $id) { "
-        "state { name } comments { nodes { body } } } }",
+        "state { name } updatedAt comments { nodes { body } } } }",
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["data"]["issue"] == {
         "state": {"name": "In Review"},
+        "updatedAt": "2026-01-01T00:00:02Z",
         "comments": {"nodes": [{"body": "Local QA comment\n"}]},
     }
 
@@ -122,7 +143,9 @@ def test_sandbox_errors_do_not_mutate_issue(sandbox: str) -> None:
         assert diagnostic in result.stderr
     result = run_cli(sandbox, "issue", "get", "LOCAL-1")
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["state"] == "Todo"
+    issue = json.loads(result.stdout)
+    assert issue["state"] == "Todo"
+    assert issue["updatedAt"] == "2026-01-01T00:00:00Z"
 
 
 @pytest.mark.parametrize(
@@ -147,3 +170,42 @@ def test_sandbox_rejects_bad_http_requests(
     )
     assert reply.status == status
     assert json.loads(reply.body)["errors"]
+
+
+@pytest.mark.parametrize(
+    ("states_args", "expected"),
+    [
+        ("", ["Todo", "In Review", "Done"]),
+        ("(first: 2)", ["Todo", "In Review"]),
+        ("(filter: null)", ["Todo", "In Review", "Done"]),
+        ("(filter: {name: null})", ["Todo", "In Review", "Done"]),
+        ("(filter: {name: {}})", ["Todo", "In Review", "Done"]),
+        ("(filter: {name: {eq: null}})", ["Todo", "In Review", "Done"]),
+        ('(filter: {name: {eq: "In Review"}})', ["In Review"]),
+    ],
+)
+def test_sandbox_state_filters(
+    sandbox: str, states_args: str, expected: list[str]
+) -> None:
+    query = (
+        "query($id: String!) { issue(id: $id) { team { states"
+        + states_args
+        + " { nodes { name } } } } }"
+    )
+    result = run_cli(sandbox, "graphql", "--variables", '{"id":"LOCAL-1"}', query)
+    assert result.returncode == 0, result.stderr
+    nodes = json.loads(result.stdout)["data"]["issue"]["team"]["states"]["nodes"]
+    assert [node["name"] for node in nodes] == expected
+
+
+def test_sandbox_states_reject_negative_first(sandbox: str) -> None:
+    result = run_cli(
+        sandbox,
+        "graphql",
+        "--variables",
+        '{"id":"LOCAL-1"}',
+        "query($id: String!) { issue(id: $id) "
+        "{ team { states(first: -1) { nodes { name } } } } }",
+    )
+    assert result.returncode == 1
+    assert "first must be non-negative" in result.stderr
