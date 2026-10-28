@@ -2131,3 +2131,99 @@ def test_issues_ready_reports_graphql_errors() -> None:
     assert code == 1
     assert out == ""
     assert "bad filter" in err
+
+
+def _ago(hours: float) -> str:
+    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+
+
+def _pr(number: int, status: str = "open") -> dict[str, object]:
+    return {
+        "url": f"https://github.com/chewcorp/x/pull/{number}",
+        "metadata": {"status": status},
+    }
+
+
+def _stale_issue(
+    identifier: str,
+    state: str,
+    *,
+    entered: float = 30,
+    updated: float = 1,
+    prs: list[dict[str, object]] | None = None,
+    **overrides: object,
+) -> dict[str, object]:
+    unstarted = state in {"Ready", "Todo"}
+    node: dict[str, object] = {
+        "identifier": identifier,
+        "title": f"Title {identifier}",
+        "estimate": 1,
+        "url": f"https://linear.app/chewcorp/issue/{identifier}",
+        "updatedAt": _ago(updated),
+        "state": {"name": state, "type": "unstarted" if unstarted else "started"},
+        "delegate": None,
+        "attachments": {"nodes": prs or [], "pageInfo": {"hasNextPage": False}},
+        "history": {
+            "nodes": [
+                {"createdAt": _ago(entered + 5), "toState": {"name": "Ready"}},
+                {"createdAt": _ago(entered), "toState": {"name": state}},
+            ]
+        },
+    }
+    node.update(overrides)
+    return node
+
+
+def test_issues_stale_flags_each_rule() -> None:
+    nodes = [
+        _stale_issue("CCP-1", "Claimed", estimate=3),
+        _stale_issue("CCP-2", "Claimed", entered=2, prs=[_pr(1)]),
+        _stale_issue("CCP-3", "In Progress", estimate=5),
+        _stale_issue("CCP-4", "Ready", updated=30, delegate={"id": "cursor"}),
+        _stale_issue("CCP-5", "In Review", prs=[_pr(2), _pr(3, "merged")]),
+        _stale_issue("CCP-6", "In Review", updated=80, prs=[_pr(4)]),
+        # Clean: young claims, PR-backed work, a closed PR, an undelegated card.
+        _stale_issue("CCP-7", "Claimed", entered=2),
+        _stale_issue("CCP-8", "In Progress", prs=[_pr(5)]),
+        _stale_issue("CCP-9", "In Review", prs=[_pr(6), _pr(7, "closed")]),
+        _stale_issue("CCP-10", "Ready", updated=30),
+        _stale_issue("CCP-11", "In Progress", entered=30, history={"nodes": []}),
+        _stale_issue("CCP-12", "In Review", prs=[_pr(8), _pr(8)]),
+    ]
+    post, sent = _serve([_connection(nodes, None, False)])
+    code, out, err, calls = _run(
+        ["issues", "stale", "--team", "CCP"], environ=_KEY, post=post
+    )
+    assert calls == []
+    assert (code, err) == (0, "")
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert [(line["identifier"], line["rule"]) for line in lines] == [
+        ("CCP-3", "in-progress-no-pr"),
+        ("CCP-1", "claimed-no-pr"),
+        ("CCP-2", "claimed-has-pr"),
+        ("CCP-4", "dead-delegate"),
+        ("CCP-5", "duplicate-pr"),
+        ("CCP-6", "quiet-in-review"),
+    ]
+    assert list(lines[0]) == [
+        "identifier",
+        "title",
+        "estimate",
+        "url",
+        "rule",
+        "since",
+        "hours_over",
+    ]
+    assert 5.9 <= lines[0]["hours_over"] <= 6.1
+    assert 7.9 <= lines[5]["hours_over"] <= 8.1
+    assert sent[0]["variables"] == {"after": None, "teams": ["CCP"]}
+    assert 'type: { in: ["unstarted", "started"] }' in sent[0]["query"]
+
+
+def test_issues_stale_reports_graphql_errors() -> None:
+    post, _ = _serve([{"errors": [{"message": "bad filter"}], "data": None}])
+    code, out, err, _ = _run(
+        ["issues", "stale", "--team", "CCP"], environ=_KEY, post=post
+    )
+    assert (code, out) == (1, "")
+    assert "bad filter" in err

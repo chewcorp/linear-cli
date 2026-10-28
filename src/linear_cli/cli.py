@@ -273,6 +273,11 @@ class IssuesReady:
 
 
 @dataclass(frozen=True, slots=True)
+class IssuesStale:
+    teams: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class GetIssue:
     issue: str
     comments_since: str | None
@@ -293,7 +298,12 @@ class MoveIssue:
 Shortcut: TypeAlias = GetIssue | PostComment | MoveIssue
 
 Invocation: TypeAlias = (
-    FetchSchema | ExecuteOperation | IssuesChanged | IssuesReady | Shortcut
+    FetchSchema
+    | ExecuteOperation
+    | IssuesChanged
+    | IssuesReady
+    | IssuesStale
+    | Shortcut
 )
 
 
@@ -461,6 +471,17 @@ def parse_invocation(
         help="frontier: unstarted, estimated, specced, unblocked, unclaimed issues",
     )
     ready.add_argument("--team", required=True, help="comma-separated team keys")
+    stale = issue_commands.add_parser(
+        "stale",
+        help="cards past a time-in-state threshold, one JSON line per rule tripped",
+        description=(
+            "Rules: claimed-no-pr (Claimed 24h, no PR), claimed-has-pr (Claimed with "
+            "a PR), in-progress-no-pr (In Progress 24h, no PR), dead-delegate "
+            "(unstarted, delegate set, no PR, no update 24h), duplicate-pr (two or "
+            "more open or merged PRs), quiet-in-review (In Review, no update 72h)."
+        ),
+    )
+    stale.add_argument("--team", required=True, help="comma-separated team keys")
     comment = commands.add_parser("comment", help="post a comment on an issue")
     comment.add_argument(
         "issue", metavar="ISSUE", help="issue identifier, e.g. CCP-123"
@@ -493,6 +514,8 @@ def parse_invocation(
         return FetchSchema()
     if namespace.command == "issues" and namespace.issues_command == "ready":
         return IssuesReady(_team_keys(namespace.team))
+    if namespace.command == "issues" and namespace.issues_command == "stale":
+        return IssuesStale(_team_keys(namespace.team))
     if namespace.command == "issues":
         return IssuesChanged(
             teams=_team_keys(namespace.team),
@@ -636,9 +659,12 @@ def main(
             paginate=paginate,
         ):
             pass
-        case IssuesReady(teams=teams):
+        case IssuesReady(teams=teams) | IssuesStale(teams=teams):
+            run = (
+                _issues_ready if isinstance(invocation, IssuesReady) else _issues_stale
+            )
             try:
-                return _issues_ready(client, teams, stdout)
+                return run(client, teams, stdout)
             except GraphQLErrors as exc:
                 return _report(stderr, exc.response)
             except RemoteFailure as exc:
@@ -1110,6 +1136,127 @@ def _issues_ready(client: GraphQLClient, teams: tuple[str, ...], stdout: TextIO)
     ]
     if lines:
         stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+_STALE_QUERY: Final[str] = f"""
+query IssuesStale($after: String, $teams: [String!]!) {{
+  issues(first: {_ISSUE_PAGE_SIZE}, after: $after, filter: {{
+    team: {{ key: {{ in: $teams }} }}
+    state: {{ type: {{ in: ["unstarted", "started"] }} }}
+  }}) {{
+    nodes {{
+      identifier title estimate url updatedAt
+      state {{ name type }}
+      delegate {{ id }}
+      attachments(first: {_READY_LINK_PAGE}) {{
+        nodes {{ url metadata }} pageInfo {{ hasNextPage }}
+      }}
+      history(first: {_READY_LINK_PAGE}) {{
+        nodes {{ createdAt toState {{ name }} }}
+      }}
+    }}
+    pageInfo {{ hasNextPage endCursor }}
+  }}
+}}
+"""
+
+
+def _linked_prs(node: JsonValue) -> set[str]:
+    # A closed-unmerged PR no longer delivers the card, so it does not count as linked.
+    return {
+        str(_at(attachment, ("url",)))
+        for attachment in _nodes(_at(node, ("attachments",)))
+        if "/pull/" in str(_at(attachment, ("url",)) or "")
+        and _at(attachment, ("metadata", "status")) != "closed"
+    }
+
+
+def _entered_state(node: JsonValue) -> datetime:
+    state = _at(node, ("state", "name"))
+    entries = [
+        _when(_at(entry, ("createdAt",)))
+        for entry in _nodes(_at(node, ("history",)))
+        if _at(entry, ("toState", "name")) == state
+    ]
+    # shortcut: first history page only, else updatedAt; paginate if cards outgrow it.
+    return max(entries, default=_updated(node))
+
+
+def _updated(node: JsonValue) -> datetime:
+    return _when(_at(node, ("updatedAt",)))
+
+
+def _when(value: JsonValue) -> datetime:
+    try:
+        return _instant(str(value), "Linear timestamp")
+    except LocalInputError:
+        raise RemoteFailure(f"Linear returned a bad timestamp: {value!r}") from None
+
+
+def _stale_rules(node: JsonValue, now: datetime) -> list[tuple[str, datetime, float]]:
+    """(rule, since, threshold hours) for each rule the card trips."""
+    if _at(node, ("attachments", "pageInfo", "hasNextPage")) is not False:
+        return []
+    prs = len(_linked_prs(node))
+    state = _at(node, ("state", "name"))
+    hits: list[tuple[str, datetime, float]] = []
+    if state == "Claimed":
+        hits.append(
+            ("claimed-has-pr", _entered_state(node), 0)
+            if prs
+            else ("claimed-no-pr", _entered_state(node), 24)
+        )
+    elif state == "In Progress" and not prs:
+        hits.append(("in-progress-no-pr", _entered_state(node), 24))
+    elif state == "In Review":
+        hits.append(("quiet-in-review", _updated(node), 72))
+    elif (
+        _at(node, ("state", "type")) == "unstarted"
+        and _at(node, ("delegate",)) is not None
+        and not prs
+    ):
+        hits.append(("dead-delegate", _updated(node), 24))
+    if prs >= 2:
+        hits.append(("duplicate-pr", _updated(node), 0))
+    return [
+        (rule, since, threshold)
+        for rule, since, threshold in hits
+        if (now - since).total_seconds() / 3600 >= threshold
+    ]
+
+
+def _issues_stale(client: GraphQLClient, teams: tuple[str, ...], stdout: TextIO) -> int:
+    response = client.paginate(
+        GraphQLOperation(_STALE_QUERY, {"after": None, "teams": list(teams)})
+    )
+    if response.has_errors:
+        raise GraphQLErrors(response)
+    now = datetime.now(UTC)
+    rows: list[JsonObject] = []
+    for node in _read_page(_data(response), ("issues",)).nodes:
+        for rule, since, threshold in _stale_rules(node, now):
+            row = _project(
+                node,
+                (
+                    ("identifier", ("identifier",)),
+                    ("title", ("title",)),
+                    ("estimate", ("estimate",)),
+                    ("url", ("url",)),
+                ),
+            )
+            hours = (now - since).total_seconds() / 3600 - threshold
+            row.update(rule=rule, since=_iso(since), hours_over=round(hours, 1))
+            rows.append(row)
+    rows.sort(key=lambda row: -(_number(row["estimate"]) or 0))
+    if rows:
+        stdout.write(
+            "\n".join(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                for row in rows
+            )
+            + "\n"
+        )
     return 0
 
 
