@@ -1162,14 +1162,14 @@ query IssuesStale($after: String, $teams: [String!]!) {{
 """
 
 
-def _linked_prs(node: JsonValue) -> list[JsonValue]:
+def _linked_prs(node: JsonValue) -> set[str]:
     # A closed-unmerged PR no longer delivers the card, so it does not count as linked.
-    return [
-        attachment
+    return {
+        str(_at(attachment, ("url",)))
         for attachment in _nodes(_at(node, ("attachments",)))
         if "/pull/" in str(_at(attachment, ("url",)) or "")
         and _at(attachment, ("metadata", "status")) != "closed"
-    ]
+    }
 
 
 def _entered_state(node: JsonValue) -> datetime:
@@ -1179,8 +1179,7 @@ def _entered_state(node: JsonValue) -> datetime:
         for entry in _nodes(_at(node, ("history",)))
         if _at(entry, ("toState", "name")) == state
     ]
-    # shortcut: only the first history page is read; past it, updatedAt (later, so
-    # it under-flags rather than over-flags). Page history if cards outgrow it.
+    # shortcut: first history page only, else updatedAt; paginate if cards outgrow it.
     return max(entries, default=_updated(node))
 
 
