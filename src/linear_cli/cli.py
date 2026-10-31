@@ -478,7 +478,8 @@ def parse_invocation(
             "Rules: claimed-no-pr (Claimed 24h, no PR), claimed-has-pr (Claimed with "
             "a PR), in-progress-no-pr (In Progress 24h, no PR), dead-delegate "
             "(unstarted, delegate set, no PR, no update 24h), duplicate-pr (two or "
-            "more open or merged PRs), quiet-in-review (In Review, no update 72h)."
+            "more open or merged PRs, at least one still open), quiet-in-review "
+            "(In Review, no update 72h)."
         ),
     )
     stale.add_argument("--team", required=True, help="comma-separated team keys")
@@ -1217,7 +1218,13 @@ def _stale_rules(node: JsonValue, now: datetime) -> list[tuple[str, datetime, fl
         and not prs
     ):
         hits.append(("dead-delegate", _updated(node), 24))
-    if prs >= 2:
+    # Follow-up PRs on a card are normal; a race only matters while one can still land.
+    open_prs = any(
+        "/pull/" in str(_at(attachment, ("url",)) or "")
+        and _at(attachment, ("metadata", "status")) not in ("closed", "merged")
+        for attachment in _nodes(_at(node, ("attachments",)))
+    )
+    if prs >= 2 and open_prs:
         hits.append(("duplicate-pr", _updated(node), 0))
     return [
         (rule, since, threshold)

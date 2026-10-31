@@ -2189,6 +2189,7 @@ def test_issues_stale_flags_each_rule() -> None:
         _stale_issue("CCP-10", "Ready", updated=30),
         _stale_issue("CCP-11", "In Progress", entered=30, history={"nodes": []}),
         _stale_issue("CCP-12", "In Review", prs=[_pr(8), _pr(8)]),
+        _stale_issue("CCP-13", "In Review", prs=[_pr(9, "merged"), _pr(10, "merged")]),
     ]
     post, sent = _serve([_connection(nodes, None, False)])
     code, out, err, calls = _run(
