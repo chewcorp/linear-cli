@@ -328,7 +328,7 @@ def test_graphql_errors_on_http_400() -> None:
     assert code == 1
     assert out == json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     assert err == (
-        f"linear-cli: GraphQL response contains errors\nlinear-cli: {message}\n"
+        "linear-cli: GraphQL response contains errors\n" f"linear-cli: {message}\n"
     )
     assert len(calls) == 1
 
@@ -389,7 +389,7 @@ def test_graphql_data_omits_null_on_errors() -> None:
     assert code == 1
     assert out == ""
     assert err == (
-        f"linear-cli: GraphQL response contains errors\nlinear-cli: {message}\n"
+        "linear-cli: GraphQL response contains errors\n" f"linear-cli: {message}\n"
     )
     assert "null" not in out
     assert len(calls) == 1
