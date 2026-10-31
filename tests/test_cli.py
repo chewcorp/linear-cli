@@ -328,7 +328,7 @@ def test_graphql_errors_on_http_400() -> None:
     assert code == 1
     assert out == json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     assert err == (
-        "linear-cli: GraphQL response contains errors\n" f"linear-cli: {message}\n"
+        f"linear-cli: GraphQL response contains errors\nlinear-cli: {message}\n"
     )
     assert len(calls) == 1
 
@@ -389,7 +389,7 @@ def test_graphql_data_omits_null_on_errors() -> None:
     assert code == 1
     assert out == ""
     assert err == (
-        "linear-cli: GraphQL response contains errors\n" f"linear-cli: {message}\n"
+        f"linear-cli: GraphQL response contains errors\nlinear-cli: {message}\n"
     )
     assert "null" not in out
     assert len(calls) == 1
@@ -2189,6 +2189,7 @@ def test_issues_stale_flags_each_rule() -> None:
         _stale_issue("CCP-10", "Ready", updated=30),
         _stale_issue("CCP-11", "In Progress", entered=30, history={"nodes": []}),
         _stale_issue("CCP-12", "In Review", prs=[_pr(8), _pr(8)]),
+        _stale_issue("CCP-13", "In Review", prs=[_pr(9, "merged"), _pr(10, "merged")]),
     ]
     post, sent = _serve([_connection(nodes, None, False)])
     code, out, err, calls = _run(
