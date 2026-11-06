@@ -5,7 +5,7 @@ import subprocess
 import sys
 import threading
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPMessage, IncompleteRead
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -93,6 +93,14 @@ def test_help() -> None:
     )
     assert "schema" in out
     assert "graphql" in out
+
+
+def test_issues_changed_help() -> None:
+    code, out, err, calls = _run(["issues", "changed", "--help"])
+    assert code == 0
+    assert err == ""
+    assert calls == []
+    assert "--skip-own=MARKER" in out
 
 
 def test_version() -> None:
@@ -850,6 +858,7 @@ def _issue(
     *,
     team: str = "CCP",
     comments: list[dict[str, object]] | None = None,
+    updated_at: str = "2026-10-17T12:00:00.000Z",
 ) -> dict[str, object]:
     node: dict[str, object] = {
         "identifier": identifier,
@@ -859,7 +868,7 @@ def _issue(
         "priority": 0,
         "estimate": None,
         "cycle": None,
-        "updatedAt": "2026-10-17T12:00:00.000Z",
+        "updatedAt": updated_at,
         "url": f"https://linear.app/chewcorp/issue/{identifier}",
     }
     if comments is not None:
@@ -1376,6 +1385,853 @@ def test_comment_page_failure_leaves_the_state_file(tmp_path: Path) -> None:
     assert out == ""
     assert "comment page failed" in err
     assert state.read_text() == original
+
+
+_VIEWER = "viewer-1"
+_WINDOW = "2026-10-17T09:00:00.000Z"
+_WINDOW_ARG = "2026-10-17T09:00:00Z"
+_SHIFTED = "2026-10-17T08:59:00.000Z"
+_COMMENT_AT = "2026-10-17T12:00:00.000Z"
+_MARKER = "--analyst_ccp_claude"
+
+
+def _graphql_name(query: object) -> str:
+    text = str(query).removeprefix("query ").lstrip()
+    name: list[str] = []
+    for char in text:
+        if char.isalnum() or char == "_":
+            name.append(char)
+        else:
+            break
+    return "".join(name)
+
+
+def _named(sent: list[dict[str, object]], name: str) -> list[dict[str, object]]:
+    return [body for body in sent if _graphql_name(body["query"]) == name]
+
+
+def _activity(
+    body: str,
+    created_at: str = _COMMENT_AT,
+    *,
+    user_id: str | None = _VIEWER,
+    display_name: str | None = None,
+) -> dict[str, object]:
+    user: dict[str, object] | None = None
+    if user_id is not None or display_name is not None:
+        user = {}
+        if user_id is not None:
+            user["id"] = user_id
+        if display_name is not None:
+            user["displayName"] = display_name
+    return {"user": user, "createdAt": created_at, "body": body}
+
+
+def _serve_changed(
+    issues: list[dict[str, object]],
+    comments_for: Callable[[dict[str, object]], dict[str, object]],
+    *,
+    viewer: dict[str, object] | None = None,
+) -> tuple[_HttpPost, list[dict[str, object]]]:
+    sent: list[dict[str, object]] = []
+    viewer_payload = {"data": {"viewer": {"id": _VIEWER}}} if viewer is None else viewer
+
+    def post(
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        timeout_seconds: float,
+    ) -> _HttpReply:
+        del url, headers, timeout_seconds
+        parsed = json.loads(body)
+        assert isinstance(parsed, dict)
+        sent.append(parsed)
+        name = _graphql_name(parsed["query"])
+        if name == "IssuesChanged":
+            return _reply(_connection(issues, None, False))
+        if name == "ViewerId":
+            return _reply(viewer_payload)
+        if name == "IssueComments":
+            return _reply(comments_for(parsed))
+        raise AssertionError(name)
+
+    return post, sent
+
+
+def _advanced(state: Path, before: datetime, after: datetime) -> None:
+    stored = datetime.fromisoformat(state.read_text().strip())
+    assert before - timedelta(milliseconds=5) <= stored <= after
+
+
+def test_skip_own_drops_the_seats_newest_comment(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    original = _WINDOW + "\n"
+    state.write_text(original)
+    post, sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T12:00:30.000Z")],
+        lambda _parsed: _comment_connection([_activity("shipped")], None, False),
+    )
+    before = datetime.now(UTC)
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--skip-own",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    after = datetime.now(UTC)
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert out == ""
+    _advanced(state, before, after)
+    assert state.read_text() != original
+    assert len(_named(sent, "ViewerId")) == 1
+    assert _named(sent, "ViewerId")[0]["variables"] == {}
+    issues = _named(sent, "IssuesChanged")
+    assert issues[0]["variables"]["since"] == _WINDOW
+    assert "comments(" not in str(issues[0]["query"])
+    comments = _named(sent, "IssueComments")
+    assert len(comments) == 1
+    assert comments[0]["variables"] == {
+        "id": "CCP-1",
+        "after": None,
+        "since": _SHIFTED,
+    }
+    query = str(comments[0]["query"])
+    assert "user { id } createdAt body" in query
+    assert "createdAt: {gt: $since}" in query
+    assert "first: 50" in query
+
+
+def test_skip_own_sees_a_comment_from_the_slack_before_since() -> None:
+    created = "2026-10-17T08:59:30.000Z"
+
+    def comments_for(parsed: dict[str, object]) -> dict[str, object]:
+        variables = parsed["variables"]
+        assert isinstance(variables, dict)
+        since = variables["since"]
+        nodes = (
+            [_activity("shipped", created)]
+            if isinstance(since, str) and created > since
+            else []
+        )
+        return _comment_connection(nodes, None, False)
+
+    post, sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T09:00:20.000Z")],
+        comments_for,
+    )
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--skip-own",
+            "--since",
+            _WINDOW_ARG,
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert out == ""
+    assert _named(sent, "IssueComments")[0]["variables"]["since"] == _SHIFTED
+
+
+def test_skip_own_keeps_a_later_comment_by_someone_else() -> None:
+    post, _sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T12:05:10.000Z")],
+        lambda _parsed: _comment_connection(
+            [
+                _activity("mine"),
+                _activity("theirs", "2026-10-17T12:05:00.000Z", user_id="ada"),
+            ],
+            None,
+            False,
+        ),
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--since", _WINDOW_ARG, "--skip-own"],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)["identifier"] == "CCP-1"
+    assert _VIEWER not in out
+
+
+def test_skip_own_keeps_an_issue_updated_after_the_slack() -> None:
+    post, _sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T12:01:01.000Z")],
+        lambda _parsed: _comment_connection([_activity("mine")], None, False),
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--since", _WINDOW_ARG, "--skip-own"],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)["identifier"] == "CCP-1"
+
+
+def test_skip_own_keeps_an_issue_with_no_comments() -> None:
+    post, _sent = _serve_changed(
+        [_issue("CCP-1")],
+        lambda _parsed: _comment_connection([], None, False),
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--since", _WINDOW_ARG, "--skip-own"],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)["identifier"] == "CCP-1"
+
+
+def test_skip_own_keeps_a_tie_with_someone_else() -> None:
+    post, _sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T12:00:10.000Z")],
+        lambda _parsed: _comment_connection(
+            [_activity("mine"), _activity("theirs", user_id="ada")],
+            None,
+            False,
+        ),
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--since", _WINDOW_ARG, "--skip-own"],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)["identifier"] == "CCP-1"
+
+
+def test_skip_own_drops_two_own_comments_at_the_same_instant() -> None:
+    post, _sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T12:00:10.000Z")],
+        lambda _parsed: _comment_connection(
+            [_activity("one"), _activity("two")],
+            None,
+            False,
+        ),
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--since", _WINDOW_ARG, "--skip-own"],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert out == ""
+
+
+def test_skip_own_keeps_a_null_author_when_the_marker_matches() -> None:
+    post, _sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T12:00:10.000Z")],
+        lambda _parsed: _comment_connection(
+            [_activity(f"note\n{_MARKER}", user_id=None)],
+            None,
+            False,
+        ),
+    )
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--since",
+            _WINDOW_ARG,
+            "--skip-own",
+            _MARKER,
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)["identifier"] == "CCP-1"
+
+
+@pytest.mark.parametrize(
+    ("body", "dropped"),
+    [
+        (f"hello\n{_MARKER}", True),
+        ("hello\nshipped", False),
+        (f"{_MARKER}\nshipped", False),
+        (f"hello\n{_MARKER}\n\n", True),
+        (f"hello\n{_MARKER}\n   \n", True),
+    ],
+)
+def test_skip_own_marker_matches_the_last_nonempty_line(
+    body: str, dropped: bool
+) -> None:
+    post, sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T12:00:10.000Z")],
+        lambda _parsed: _comment_connection(
+            [_activity(body, user_id="russell")],
+            None,
+            False,
+        ),
+    )
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--since",
+            _WINDOW_ARG,
+            "--skip-own",
+            _MARKER,
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert len(_named(sent, "ViewerId")) == 1
+    if dropped:
+        assert out == ""
+    else:
+        assert json.loads(out)["identifier"] == "CCP-1"
+
+
+def test_skip_own_matches_a_marker_past_the_display_cut() -> None:
+    body = ("x" * 300) + f"\n{_MARKER}"
+    post, sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T12:00:10.000Z")],
+        lambda _parsed: _comment_connection(
+            [_activity(body, user_id="russell")],
+            None,
+            False,
+        ),
+    )
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--since",
+            _WINDOW_ARG,
+            "--skip-own",
+            _MARKER,
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert out == ""
+    comments = _named(sent, "IssueComments")
+    assert len(comments) == 1
+    assert "user { id }" in str(comments[0]["query"])
+    assert "displayName" not in str(comments[0]["query"])
+
+
+def test_issues_changed_without_skip_own_keeps_its_documents() -> None:
+    post, sent = _serve([_connection([_issue("CCP-1")], None, False)])
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--since", _WINDOW_ARG],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert out != ""
+    assert "comments(" not in str(sent[0]["query"])
+    assert _named(sent, "ViewerId") == []
+
+    recorded: list[dict[str, object]] = []
+
+    def post_comments(
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        timeout_seconds: float,
+    ) -> _HttpReply:
+        del url, headers, timeout_seconds
+        parsed = json.loads(body)
+        assert isinstance(parsed, dict)
+        recorded.append(parsed)
+        variables = parsed["variables"]
+        assert isinstance(variables, dict)
+        if "teams" in variables:
+            return _reply(_connection([_issue("CCP-9")], None, False))
+        return _reply(
+            _comment_connection(
+                [
+                    {
+                        "body": "hi",
+                        "createdAt": "2026-10-17T12:30:00.000Z",
+                        "user": {"displayName": "Ada"},
+                    }
+                ],
+                None,
+                False,
+            )
+        )
+
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--since",
+            _WINDOW_ARG,
+            "--with-comments",
+        ],
+        environ=_KEY,
+        post=post_comments,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    comment = next(body for body in recorded if "teams" not in body["variables"])
+    query = str(comment["query"])
+    assert "user { displayName }" in query
+    assert "user { id }" not in query
+
+
+def test_skip_own_viewer_error_leaves_the_state_file(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    original = _WINDOW + "\n"
+    state.write_text(original)
+    post, _sent = _serve_changed(
+        [_issue("CCP-1")],
+        lambda _parsed: _comment_connection([], None, False),
+        viewer={"errors": [{"message": "viewer down"}]},
+    )
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--skip-own",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 1
+    assert out == ""
+    assert "viewer down" in err
+    assert state.read_text() == original
+
+
+def test_skip_own_comment_error_leaves_the_state_file(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    original = _WINDOW + "\n"
+    state.write_text(original)
+    post, _sent = _serve_changed(
+        [_issue("CCP-1")],
+        lambda _parsed: {"errors": [{"message": "comments down"}]},
+    )
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--skip-own",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 1
+    assert out == ""
+    assert "comments down" in err
+    assert state.read_text() == original
+
+
+def test_skip_own_blank_viewer_id_leaves_the_state_file(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    original = _WINDOW + "\n"
+    state.write_text(original)
+    post, _sent = _serve_changed(
+        [_issue("CCP-1")],
+        lambda _parsed: _comment_connection([], None, False),
+        viewer={"data": {"viewer": {"id": "   "}}},
+    )
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--skip-own",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 1
+    assert out == ""
+    assert "viewer id was missing" in err
+    assert state.read_text() == original
+
+
+def test_skip_own_repeated_comment_cursor_leaves_the_state_file(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "wake"
+    original = _WINDOW + "\n"
+    state.write_text(original)
+    post, _sent = _serve_changed(
+        [_issue("CCP-1")],
+        lambda _parsed: _comment_connection([_activity("own")], "c1", True),
+    )
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--skip-own",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 1
+    assert out == ""
+    assert "cursor did not advance" in err
+    assert state.read_text() == original
+
+
+def test_skip_own_keeps_the_issue_when_comment_pages_hit_the_cap(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "wake"
+    original = _WINDOW + "\n"
+    state.write_text(original)
+
+    def comments_for(parsed: dict[str, object]) -> dict[str, object]:
+        variables = parsed["variables"]
+        assert isinstance(variables, dict)
+        after = variables.get("after")
+        nxt = 1 if after is None else int(str(after)) + 1
+        return _comment_connection([_activity("own")], str(nxt), True)
+
+    post, sent = _serve_changed([_issue("CCP-1")], comments_for)
+    before = datetime.now(UTC)
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--skip-own",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    after = datetime.now(UTC)
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)["identifier"] == "CCP-1"
+    comments = _named(sent, "IssueComments")
+    assert len(comments) == 500
+    assert len({body["variables"]["after"] for body in comments}) == 500
+    _advanced(state, before, after)
+
+
+def test_skip_own_with_comments_skips_the_display_read() -> None:
+    long_body = "k" * 300
+
+    def comments_for(parsed: dict[str, object]) -> dict[str, object]:
+        variables = parsed["variables"]
+        assert isinstance(variables, dict)
+        query = str(parsed["query"])
+        if variables["id"] == "CCP-SKIP":
+            return _comment_connection([_activity("mine")], None, False)
+        if "displayName" in query:
+            node = _activity(long_body, user_id=None, display_name="Ada")
+        else:
+            node = _activity(long_body, user_id="ada")
+        return _comment_connection([node], None, False)
+
+    updated = "2026-10-17T12:00:20.000Z"
+    post, sent = _serve_changed(
+        [
+            _issue("CCP-SKIP", updated_at=updated),
+            _issue("CCP-KEEP", updated_at=updated),
+        ],
+        comments_for,
+    )
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--since",
+            _WINDOW_ARG,
+            "--skip-own",
+            "--with-comments",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert "CCP-SKIP" not in out
+    line = json.loads(out)
+    assert line["identifier"] == "CCP-KEEP"
+    assert line["comments"] == [
+        {"author": "Ada", "createdAt": _COMMENT_AT, "body": "k" * 280}
+    ]
+    comment_requests = _named(sent, "IssueComments")
+    skip_requests = [
+        body for body in comment_requests if "user { id }" in str(body["query"])
+    ]
+    display_requests = [
+        body for body in comment_requests if "displayName" in str(body["query"])
+    ]
+    assert {body["variables"]["id"] for body in skip_requests} == {
+        "CCP-SKIP",
+        "CCP-KEEP",
+    }
+    assert [body["variables"]["id"] for body in display_requests] == ["CCP-KEEP"]
+    assert {body["variables"]["since"] for body in skip_requests} == {_SHIFTED}
+    assert {body["variables"]["since"] for body in display_requests} == {_WINDOW}
+
+
+def test_skip_own_baselines_a_missing_state_file(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    before = datetime.now(UTC)
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--skip-own",
+        ],
+        environ=_KEY,
+    )
+    after = datetime.now(UTC)
+    assert code == 0
+    assert out == ""
+    assert err == ""
+    assert calls == []
+    _advanced(state, before, after)
+
+
+def test_skip_own_rejects_a_blank_marker(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    original = _WINDOW + "\n"
+    state.write_text(original)
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--skip-own",
+            "   ",
+        ],
+        environ=_KEY,
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert err != ""
+    assert state.read_text() == original
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--team=CCP", f"--since={_WINDOW_ARG}"],
+        [f"--since={_WINDOW_ARG}", "--team=CCP"],
+        ["--te=CCP", f"--si={_WINDOW_ARG}"],
+        ["--te", "CCP", "--si", _WINDOW_ARG],
+        ["--with", "--team=CCP", f"--since={_WINDOW_ARG}"],
+        ["--skip-own", "--team=CCP", f"--since={_WINDOW_ARG}"],
+    ],
+)
+def test_skip_own_preserves_option_syntax(options: list[str]) -> None:
+    invocation = cli_mod.parse_invocation(
+        ["issues", "changed", "--skip-own", *options],
+        io.StringIO(),
+        io.StringIO(),
+        io.StringIO(),
+    )
+    assert isinstance(invocation, cli_mod.IssuesChanged)
+    assert invocation.teams == ("CCP",)
+    assert invocation.window == cli_mod.Since(datetime.fromisoformat(_WINDOW_ARG))
+    assert invocation.skip_own == cli_mod.SkipOwn(None)
+    assert invocation.with_comments == ("--with" in options)
+
+
+@pytest.mark.parametrize("marker", ["--si", "--s", "--", "--team=CCP"])
+def test_skip_own_parses_option_like_marker_with_equals(marker: str) -> None:
+    invocation = cli_mod.parse_invocation(
+        [
+            "issues",
+            "changed",
+            "--team=CCP",
+            f"--since={_WINDOW_ARG}",
+            f"--skip-own={marker}",
+        ],
+        io.StringIO(),
+        io.StringIO(),
+        io.StringIO(),
+    )
+    assert isinstance(invocation, cli_mod.IssuesChanged)
+    assert invocation.skip_own == cli_mod.SkipOwn(marker)
+    assert invocation.teams == ("CCP",)
+    assert invocation.window == cli_mod.Since(datetime.fromisoformat(_WINDOW_ARG))
+
+
+@pytest.mark.parametrize("option", ["--state-file", "--st"])
+def test_skip_own_preserves_equals_state_file(option: str, tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    post, _sent = _serve_changed(
+        [], lambda _parsed: _comment_connection([], None, False)
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team=CCP", "--skip-own", f"{option}={state}"],
+        environ=_KEY,
+        post=post,
+    )
+    assert code == 0
+    assert out == err == ""
+    assert calls == []
+    assert state.exists()
+
+
+def test_skip_own_does_not_take_with_comments_as_the_marker() -> None:
+    def comments_for(parsed: dict[str, object]) -> dict[str, object]:
+        query = str(parsed["query"])
+        if "displayName" in query:
+            node = _activity("hello", user_id=None, display_name="Ada")
+        else:
+            node = _activity("hello", user_id="ada")
+        return _comment_connection([node], None, False)
+
+    post, sent = _serve_changed([_issue("CCP-1")], comments_for)
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--since",
+            _WINDOW_ARG,
+            "--skip-own",
+            "--with-comments",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    line = json.loads(out)
+    assert line["comments"] == [
+        {"author": "Ada", "createdAt": _COMMENT_AT, "body": "hello"}
+    ]
+    comment_requests = _named(sent, "IssueComments")
+    assert any("user { id }" in str(body["query"]) for body in comment_requests)
+    assert any("displayName" in str(body["query"]) for body in comment_requests)
+
+
+def test_skip_own_empty_page_does_not_read_the_viewer(tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    state.write_text(_WINDOW + "\n")
+    post, sent = _serve_changed(
+        [],
+        lambda _parsed: _comment_connection([], None, False),
+    )
+    before = datetime.now(UTC)
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "CCP",
+            "--state-file",
+            str(state),
+            "--skip-own",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    after = datetime.now(UTC)
+    assert calls == []
+    assert code == 0
+    assert out == ""
+    assert err == ""
+    assert _named(sent, "ViewerId") == []
+    assert _named(sent, "IssueComments") == []
+    _advanced(state, before, after)
+
+
+def test_skip_own_keeps_an_issue_when_a_created_at_will_not_parse() -> None:
+    post, _sent = _serve_changed(
+        [_issue("CCP-1", updated_at="2026-10-17T12:00:10.000Z")],
+        lambda _parsed: _comment_connection(
+            [_activity("mine"), _activity("nope", "not-a-time", user_id="ada")],
+            None,
+            False,
+        ),
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team", "CCP", "--since", _WINDOW_ARG, "--skip-own"],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert code == 0
+    assert err == ""
+    assert json.loads(out)["identifier"] == "CCP-1"
 
 
 def _posted(sent: list[dict[str, object]]) -> list[tuple[str, object]]:

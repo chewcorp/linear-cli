@@ -11,7 +11,7 @@ import tomllib
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.client import IncompleteRead
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -259,12 +259,27 @@ class Baseline:
 
 Window: TypeAlias = Since | Resume | Baseline
 
+_OWN_SLACK: Final[timedelta] = timedelta(seconds=60)
+
+
+@dataclass(frozen=True, slots=True)
+class SkipOwn:
+    marker: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CommentStamp:
+    author_id: str | None
+    created_at: datetime | None
+    body: str | None
+
 
 @dataclass(frozen=True, slots=True)
 class IssuesChanged:
     teams: tuple[str, ...]
     window: Window
     with_comments: bool
+    skip_own: SkipOwn | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,6 +368,11 @@ class RemoteFailure(Exception):
     pass
 
 
+class _PageCap(RemoteFailure):
+    def __init__(self) -> None:
+        super().__init__(f"pagination stopped after {_MAX_PAGES} pages")
+
+
 class GraphQLErrors(RemoteFailure):
     def __init__(self, response: GraphQLResponse) -> None:
         super().__init__("GraphQL response contains errors")
@@ -398,6 +418,49 @@ def graphql_url_from_env(environ: Mapping[str, str]) -> str:
             "on localhost, 127.0.0.1, or ::1"
         )
     return url
+
+
+def _attach_skip_own_marker(argv: Sequence[str]) -> list[str]:
+    items = list(argv)
+    if items[:2] != ["issues", "changed"]:
+        return items
+    known = {
+        "--team",
+        "--since",
+        "--state-file",
+        "--with-comments",
+        "--skip-own",
+        "--help",
+        "-h",
+        "--version",
+    }
+    rewritten: list[str] = []
+    index = 0
+    while index < len(items):
+        token = items[index]
+        if (
+            token == "--skip-own"
+            and index + 1 < len(items)
+            and not any(
+                option.startswith(items[index + 1].split("=", 1)[0]) for option in known
+            )
+        ):
+            rewritten.append(f"--skip-own={items[index + 1]}")
+            index += 2
+            continue
+        rewritten.append(token)
+        index += 1
+    return rewritten
+
+
+def _own_flag(raw: str | None) -> SkipOwn | None:
+    if raw is None:
+        return None
+    if raw == "":
+        return SkipOwn(None)
+    if raw.strip() == "":
+        raise LocalInputError("--skip-own marker is blank")
+    return SkipOwn(raw)
 
 
 def parse_invocation(
@@ -466,6 +529,17 @@ def parse_invocation(
         action="store_true",
         help="include comments created since the same time",
     )
+    changed.add_argument(
+        "--skip-own",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MARKER",
+        help=(
+            "drop an issue whose newest comment is this seat's own write; "
+            "option-like MARKERs use --skip-own=MARKER"
+        ),
+    )
     ready = issue_commands.add_parser(
         "ready",
         help="frontier: unstarted, estimated, specced, unblocked, unclaimed issues",
@@ -510,7 +584,7 @@ def parse_invocation(
         metavar="NAME",
         help="exact workflow state name on the issue's team",
     )
-    namespace = parser.parse_args(list(argv))
+    namespace = parser.parse_args(_attach_skip_own_marker(argv))
     if namespace.command == "schema":
         return FetchSchema()
     if namespace.command == "issues" and namespace.issues_command == "ready":
@@ -522,6 +596,7 @@ def parse_invocation(
             teams=_team_keys(namespace.team),
             window=_window(namespace.since, namespace.state_file),
             with_comments=namespace.with_comments,
+            skip_own=_own_flag(namespace.skip_own),
         )
     if namespace.command == "comment":
         return PostComment(namespace.issue, _body(namespace.body_file, stdin))
@@ -610,7 +685,7 @@ class GraphQLClient:
             variables = dict(current.variables)
             variables["after"] = cursor
             current = GraphQLOperation(operation.document, variables)
-        raise RemoteFailure(f"pagination stopped after {_MAX_PAGES} pages")
+        raise _PageCap()
 
     def data(self, operation: GraphQLOperation) -> JsonObject:
         response = self.execute(operation)
@@ -883,14 +958,18 @@ def _issues_changed_operation(
     return GraphQLOperation(document, variables)
 
 
-def _issue_comments_operation(identifier: str, since: datetime) -> GraphQLOperation:
+def _issue_comments_operation(
+    identifier: str,
+    since: datetime,
+    selection: str = _selection(_COMMENT_FIELDS),
+) -> GraphQLOperation:
     document = (
         "query IssueComments($id: String!, $after: String, "
         "$since: DateTimeOrDuration!) { "
         "issue(id: $id) { "
         f"comments(first: {_COMMENT_PAGE_SIZE}, after: $after, "
         "filter: {createdAt: {gt: $since}}) { "
-        f"nodes {{ {_selection(_COMMENT_FIELDS)} }} "
+        f"nodes {{ {selection} }} "
         "pageInfo { hasNextPage endCursor } } } }"
     )
     return GraphQLOperation(
@@ -979,6 +1058,116 @@ def _node_with_comments(
     return copied
 
 
+def _parsed_instant(value: JsonValue) -> datetime | None:
+    if not isinstance(value, str) or value == "":
+        return None
+    try:
+        return _instant(value, "Linear timestamp")
+    except LocalInputError:
+        return None
+
+
+def _comment_stamp(node: JsonValue) -> _CommentStamp:
+    if not isinstance(node, dict):
+        return _CommentStamp(None, None, None)
+    user = node.get("user")
+    author_id = None
+    if isinstance(user, dict):
+        raw = user.get("id")
+        if isinstance(raw, str) and raw != "":
+            author_id = raw
+    body = node.get("body")
+    return _CommentStamp(
+        author_id,
+        _parsed_instant(node.get("createdAt")),
+        body if isinstance(body, str) else None,
+    )
+
+
+def _last_nonempty_line(body: str) -> str:
+    for line in reversed(body.splitlines()):
+        if line.strip() != "":
+            return line
+    return ""
+
+
+def _seat_wrote(stamp: _CommentStamp, viewer_id: str, marker: str | None) -> bool:
+    if stamp.author_id == viewer_id:
+        return True
+    if marker is None or stamp.author_id is None or stamp.body is None:
+        return False
+    return marker in _last_nonempty_line(stamp.body)
+
+
+def _newest_created_at(stamps: Sequence[_CommentStamp]) -> datetime | None:
+    newest: datetime | None = None
+    for stamp in stamps:
+        created_at = stamp.created_at
+        if created_at is None:
+            return None
+        if newest is None or created_at > newest:
+            newest = created_at
+    return newest
+
+
+def _skips_own(
+    stamps: Sequence[_CommentStamp],
+    updated_at: datetime | None,
+    viewer_id: str,
+    marker: str | None,
+    complete: bool,
+) -> bool:
+    if not complete or updated_at is None:
+        return False
+    newest = _newest_created_at(stamps)
+    if newest is None or updated_at > newest + _OWN_SLACK:
+        return False
+    return all(
+        _seat_wrote(stamp, viewer_id, marker)
+        for stamp in stamps
+        if stamp.created_at == newest
+    )
+
+
+def _viewer_id(client: GraphQLClient) -> str:
+    data = client.data(GraphQLOperation("query ViewerId { viewer { id } }", {}))
+    viewer = data.get("viewer")
+    if isinstance(viewer, dict):
+        value = viewer.get("id")
+        if isinstance(value, str) and value.strip() != "":
+            return value
+    raise RemoteFailure("viewer id was missing")
+
+
+def _issue_skips_own(
+    client: GraphQLClient,
+    node: JsonValue,
+    since: datetime,
+    viewer_id: str,
+    skip: SkipOwn,
+) -> bool:
+    try:
+        response = client.paginate(
+            _issue_comments_operation(
+                _identifier(node),
+                since - _OWN_SLACK,
+                "user { id } createdAt body",
+            )
+        )
+    except _PageCap:
+        return False
+    if response.has_errors:
+        raise GraphQLErrors(response)
+    page = _read_page(_data(response), ("issue", "comments"))
+    return _skips_own(
+        tuple(_comment_stamp(item) for item in page.nodes),
+        _parsed_instant(_at(node, ("updatedAt",))),
+        viewer_id,
+        skip.marker,
+        not page.has_next_page,
+    )
+
+
 def _write_watermark(path: Path, at: datetime) -> None:
     fd, name = tempfile.mkstemp(prefix=".linear-wake-", dir=path.parent)
     try:
@@ -1022,10 +1211,19 @@ def _issues_changed(
         return _report(stderr, response)
     page = _read_page(_data(response), ("issues",))
     try:
-        nodes = [
-            _node_with_comments(client, node, at) if command.with_comments else node
-            for node in page.nodes
-        ]
+        skip = command.skip_own
+        viewer_id = _viewer_id(client) if skip is not None and page.nodes else None
+        nodes: list[JsonValue] = []
+        for node in page.nodes:
+            if (
+                skip is not None
+                and viewer_id is not None
+                and _issue_skips_own(client, node, at, viewer_id, skip)
+            ):
+                continue
+            nodes.append(
+                _node_with_comments(client, node, at) if command.with_comments else node
+            )
     except GraphQLErrors as exc:
         return _report(stderr, exc.response)
     lines = [_issue_line(node, command.with_comments) for node in nodes]
