@@ -429,6 +429,7 @@ def _attach_skip_own_marker(argv: Sequence[str]) -> list[str]:
         "--since",
         "--state-file",
         "--with-comments",
+        "--skip-own",
         "--help",
         "-h",
         "--version",
@@ -440,7 +441,9 @@ def _attach_skip_own_marker(argv: Sequence[str]) -> list[str]:
         if (
             token == "--skip-own"
             and index + 1 < len(items)
-            and items[index + 1] not in known
+            and not any(
+                option.startswith(items[index + 1].split("=", 1)[0]) for option in known
+            )
         ):
             rewritten.append(f"--skip-own={items[index + 1]}")
             index += 2

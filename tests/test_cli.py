@@ -2077,6 +2077,48 @@ def test_skip_own_rejects_a_blank_marker(tmp_path: Path) -> None:
     assert state.read_text() == original
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--team=CCP", f"--since={_WINDOW_ARG}"],
+        [f"--since={_WINDOW_ARG}", "--team=CCP"],
+        ["--te=CCP", f"--si={_WINDOW_ARG}"],
+        ["--te", "CCP", "--si", _WINDOW_ARG],
+        ["--with", "--team=CCP", f"--since={_WINDOW_ARG}"],
+        ["--skip-own", "--team=CCP", f"--since={_WINDOW_ARG}"],
+    ],
+)
+def test_skip_own_preserves_option_syntax(options: list[str]) -> None:
+    invocation = cli_mod.parse_invocation(
+        ["issues", "changed", "--skip-own", *options],
+        io.StringIO(),
+        io.StringIO(),
+        io.StringIO(),
+    )
+    assert isinstance(invocation, cli_mod.IssuesChanged)
+    assert invocation.teams == ("CCP",)
+    assert invocation.window == cli_mod.Since(datetime.fromisoformat(_WINDOW_ARG))
+    assert invocation.skip_own == cli_mod.SkipOwn(None)
+    assert invocation.with_comments == ("--with" in options)
+
+
+@pytest.mark.parametrize("option", ["--state-file", "--st"])
+def test_skip_own_preserves_equals_state_file(option: str, tmp_path: Path) -> None:
+    state = tmp_path / "wake"
+    post, _sent = _serve_changed(
+        [], lambda _parsed: _comment_connection([], None, False)
+    )
+    code, out, err, calls = _run(
+        ["issues", "changed", "--team=CCP", "--skip-own", f"{option}={state}"],
+        environ=_KEY,
+        post=post,
+    )
+    assert code == 0
+    assert out == err == ""
+    assert calls == []
+    assert state.exists()
+
+
 def test_skip_own_does_not_take_with_comments_as_the_marker() -> None:
     def comments_for(parsed: dict[str, object]) -> dict[str, object]:
         query = str(parsed["query"])
