@@ -95,6 +95,14 @@ def test_help() -> None:
     assert "graphql" in out
 
 
+def test_issues_changed_help() -> None:
+    code, out, err, calls = _run(["issues", "changed", "--help"])
+    assert code == 0
+    assert err == ""
+    assert calls == []
+    assert "--skip-own=MARKER" in out
+
+
 def test_version() -> None:
     code, out, err, calls = _run(["--version"])
     assert code == 0
@@ -2100,6 +2108,26 @@ def test_skip_own_preserves_option_syntax(options: list[str]) -> None:
     assert invocation.window == cli_mod.Since(datetime.fromisoformat(_WINDOW_ARG))
     assert invocation.skip_own == cli_mod.SkipOwn(None)
     assert invocation.with_comments == ("--with" in options)
+
+
+@pytest.mark.parametrize("marker", ["--si", "--s", "--", "--team=CCP"])
+def test_skip_own_parses_option_like_marker_with_equals(marker: str) -> None:
+    invocation = cli_mod.parse_invocation(
+        [
+            "issues",
+            "changed",
+            "--team=CCP",
+            f"--since={_WINDOW_ARG}",
+            f"--skip-own={marker}",
+        ],
+        io.StringIO(),
+        io.StringIO(),
+        io.StringIO(),
+    )
+    assert isinstance(invocation, cli_mod.IssuesChanged)
+    assert invocation.skip_own == cli_mod.SkipOwn(marker)
+    assert invocation.teams == ("CCP",)
+    assert invocation.window == cli_mod.Since(datetime.fromisoformat(_WINDOW_ARG))
 
 
 @pytest.mark.parametrize("option", ["--state-file", "--st"])

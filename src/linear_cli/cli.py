@@ -536,8 +536,8 @@ def parse_invocation(
         default=None,
         metavar="MARKER",
         help=(
-            "drop an issue whose newest comment is this seat's own write, "
-            "optional MARKER"
+            "drop an issue whose newest comment is this seat's own write; "
+            "option-like MARKERs use --skip-own=MARKER"
         ),
     )
     ready = issue_commands.add_parser(

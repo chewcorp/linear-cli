@@ -61,6 +61,7 @@ It then writes the time the run started.
 A failed run leaves the file unchanged, so the next run repeats the window.
 Pass `--since 2026-10-17T09:00:00Z` instead of `--state-file` when you want one window and no file.
 Add `--with-comments` to include comments created in that same window.
+Add `--skip-own` to omit issues whose newest comment is this seat's own write. An optional marker can follow, as in `--skip-own --analyst_ccp_claude`; for markers that collide with an option name or abbreviation, use the equals form, such as `--skip-own=--si`.
 
 `graphql --paginate` follows one connection that declares `$after` and selects `pageInfo { hasNextPage endCursor }`, then prints those pages as one result.
 
