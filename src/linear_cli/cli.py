@@ -517,7 +517,12 @@ def parse_invocation(
         "changed",
         help="issues updated since a time",
     )
-    changed.add_argument("--team", required=True, help="comma-separated team keys")
+    changed.add_argument(
+        "--team",
+        action="append",
+        required=True,
+        help="comma-separated team keys, repeatable",
+    )
     window = changed.add_mutually_exclusive_group(required=True)
     window.add_argument("--since", help="ISO-8601 time with a timezone")
     window.add_argument(
@@ -544,7 +549,12 @@ def parse_invocation(
         "ready",
         help="frontier: unstarted, estimated, specced, unblocked, unclaimed issues",
     )
-    ready.add_argument("--team", required=True, help="comma-separated team keys")
+    ready.add_argument(
+        "--team",
+        action="append",
+        required=True,
+        help="comma-separated team keys, repeatable",
+    )
     stale = issue_commands.add_parser(
         "stale",
         help="cards past a time-in-state threshold, one JSON line per rule tripped",
@@ -556,7 +566,12 @@ def parse_invocation(
             "(In Review, no update 72h)."
         ),
     )
-    stale.add_argument("--team", required=True, help="comma-separated team keys")
+    stale.add_argument(
+        "--team",
+        action="append",
+        required=True,
+        help="comma-separated team keys, repeatable",
+    )
     comment = commands.add_parser("comment", help="post a comment on an issue")
     comment.add_argument(
         "issue", metavar="ISSUE", help="issue identifier, e.g. CCP-123"
@@ -873,9 +888,9 @@ def _with_connection(
     return cloned
 
 
-def _team_keys(raw: str) -> tuple[str, ...]:
+def _team_keys(raw: Sequence[str]) -> tuple[str, ...]:
     keys: list[str] = []
-    for part in raw.split(","):
+    for part in ",".join(raw).split(","):
         key = part.strip()
         if key and key not in keys:
             keys.append(key)
