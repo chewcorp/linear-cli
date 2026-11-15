@@ -1047,6 +1047,107 @@ def test_issues_changed_filters_named_teams() -> None:
     assert "comments(" not in query
 
 
+@pytest.mark.parametrize("command", ["changed", "ready", "stale"])
+def test_repeated_team_matches_the_comma_form(command: str) -> None:
+    catalog = [
+        _issue("CCP-1", team="CCP"),
+        _issue("CPB-2", team="CPB"),
+        _issue("BRD-3", team="BRD"),
+    ]
+    tail = ["--since", "2026-10-17T09:00:00Z"] if command == "changed" else []
+
+    def run(team_args: list[str]) -> tuple[str, list[object]]:
+        sent: list[dict[str, object]] = []
+
+        def post(
+            *,
+            url: str,
+            headers: Mapping[str, str],
+            body: bytes,
+            timeout_seconds: float,
+        ) -> _HttpReply:
+            del url, headers, timeout_seconds
+            payload = json.loads(body)
+            sent.append(payload)
+            teams = payload["variables"]["teams"]
+            # changed prints the server rows; ready and stale apply their own filters.
+            kept = (
+                [node for node in catalog if node["team"] in teams]
+                if command == "changed"
+                else []
+            )
+            return _HttpReply(
+                200, "OK", json.dumps(_connection(kept, None, False)).encode()
+            )
+
+        code, out, err, calls = _run(
+            ["issues", command, *team_args, *tail],
+            environ=_KEY,
+            post=post,
+        )
+        assert calls == []
+        assert code == 0
+        assert err == ""
+        teams = sent[0]["variables"]["teams"]
+        assert isinstance(teams, list)
+        return out, teams
+
+    repeated = run(["--team", "CCP", "--team", "CPB"])
+    comma = run(["--team", "CCP,CPB"])
+    equals = run(["--team=CCP", "--team=CPB"])
+    assert repeated == comma == equals
+    assert repeated[1] == ["CCP", "CPB"]
+    if command == "changed":
+        assert [
+            json.loads(line)["identifier"] for line in repeated[0].splitlines()
+        ] == [
+            "CCP-1",
+            "CPB-2",
+        ]
+
+
+def test_repeated_team_merges_commas_whitespace_and_duplicates() -> None:
+    post, sent = _serve([_connection([], None, False)])
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            " CCP, CPB ",
+            "--since",
+            "2026-10-17T09:00:00Z",
+            "--team=BRD",
+            "--team",
+            "CCP",
+        ],
+        environ=_KEY,
+        post=post,
+    )
+    assert calls == []
+    assert (code, out, err) == (0, "", "")
+    assert sent[0]["variables"]["teams"] == ["CCP", "CPB", "BRD"]
+
+
+def test_repeated_blank_team_still_fails() -> None:
+    code, out, err, calls = _run(
+        [
+            "issues",
+            "changed",
+            "--team",
+            "",
+            "--team",
+            " , ",
+            "--since",
+            "2026-10-17T09:00:00Z",
+        ],
+        environ=_KEY,
+    )
+    assert code == 2
+    assert out == ""
+    assert calls == []
+    assert "team" in err
+
+
 def test_issues_changed_state_file_advances_only_after_success(tmp_path: Path) -> None:
     state = tmp_path / "wake"
     state.write_text("2026-10-17T09:00:00.000Z\n")
